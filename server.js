@@ -213,6 +213,14 @@ app.get("/api/match", auth, wrap(async (req, res) => {
 }));
 
 /* ============== 启动 ============== */
-store.init().then(() => {
-  app.listen(PORT, () => console.log(`✅ 家教帮已启动： http://localhost:${PORT}`));
-}).catch((e) => { console.error("数据库初始化失败：", e); process.exit(1); });
+// 本地直接运行：初始化数据库并监听端口
+if (require.main === module) {
+  store.init().then(() => {
+    app.listen(PORT, () => console.log(`✅ 家教帮已启动： http://localhost:${PORT}`));
+  }).catch((e) => { console.error("数据库初始化失败：", e); process.exit(1); });
+} else {
+  // 被 import（如 Vercel serverless）：建表幂等，后台执行一次，不阻塞请求
+  store.init().catch((e) => console.error("建表失败：", e));
+}
+
+module.exports = app;

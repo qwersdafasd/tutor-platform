@@ -7,6 +7,9 @@ const { Pool } = require("pg");
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }, // Supabase 需要 SSL
+  max: 3, // serverless 环境下限制连接数，避免占满免费库
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000,
 });
 const q = (sql, params) => pool.query(sql, params);
 const num = (v) => (v == null ? 0 : Number(v));
