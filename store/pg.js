@@ -4,9 +4,15 @@
  */
 const { Pool } = require("pg");
 
+// 本地 PG（localhost/127.0.0.1）默认不开 SSL；远程库（如 Supabase）才需要 SSL。
+// 也可用 PGSSL=off 强制关闭、PGSSL=on 强制开启。
+const CONN = process.env.DATABASE_URL || "";
+const sslMode = (process.env.PGSSL || "").toLowerCase();
+const isLocal = /@(localhost|127\.0\.0\.1|::1)/.test(CONN);
+const useSSL = sslMode === "on" ? true : sslMode === "off" ? false : !isLocal;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Supabase 需要 SSL
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
   max: 3, // serverless 环境下限制连接数，避免占满免费库
   idleTimeoutMillis: 10000,
   connectionTimeoutMillis: 15000,
@@ -15,21 +21,33 @@ const q = (sql, params) => pool.query(sql, params);
 const num = (v) => (v == null ? 0 : Number(v));
 
 function rowToTutor(r) {
+  const now = Date.now();
+  const vipExpire = num(r.vip_expire), boostExpire = num(r.boost_expire);
   return {
     userId: r.user_id, name: r.name, phone: r.phone, school: r.school || "", major: r.major || "",
     grade: r.grade || "", subjects: r.subjects || [], modes: r.modes || [], region: r.region || "",
     hourlyRate: num(r.hourly_rate), bio: r.bio || "", tags: r.tags || [],
-    verified: !!r.verified, boosted: !!r.boosted, verifyInfo: r.verify_info || undefined,
+    verified: !!r.verified, verifyInfo: r.verify_info || undefined,
+    vipExpire, boostExpire, vip: vipExpire > now, boosted: boostExpire > now, // 由到期时间派生
     createdAt: num(r.created_at), avg: r.avg != null ? Number(r.avg) : 0, count: num(r.count),
   };
+}
+function rowToOrder(r) {
+  return { id: r.id, userId: r.user_id, type: r.type, plan: r.plan, amount: num(r.amount),
+    days: num(r.days), outTradeNo: r.out_trade_no, status: r.status, createdAt: num(r.created_at), paidAt: num(r.paid_at) };
 }
 function rowToReq(r) {
   return { id: r.id, parentId: r.parent_id, subject: r.subject, grade: r.grade, mode: r.mode,
     region: r.region || "", budget: r.budget || "", desc: r.descr || "", phone: r.phone, createdAt: num(r.created_at) };
 }
 function rowToMsg(r) {
-  return { id: r.id, fromId: r.from_id, toId: r.to_id, text: r.text, read: !!r.read, createdAt: num(r.created_at) };
+  return { id: r.id, fromId: r.from_id, toId: r.to_id, text: r.text || "",
+    kind: r.kind || "text", fileUrl: r.file_url || undefined, fileName: r.file_name || undefined,
+    read: !!r.read, createdAt: num(r.created_at) };
 }
+// 会话列表里展示的“最后一条”摘要：图片/文件不显示原始链接
+const msgPreview = (m) => m.kind === "image" ? "[图片]" : m.kind === "file" ? `[文件] ${m.fileName || ""}`.trim() : (m.text || "");
+const rowToUser = (u) => ({ id: u.id, name: u.name, phone: u.phone, role: u.role, pwd: u.pwd, banned: !!u.banned, createdAt: num(u.created_at) });
 
 module.exports = {
   kind: "postgres",
@@ -54,6 +72,18 @@ module.exports = {
       id SERIAL PRIMARY KEY, from_id INTEGER, to_id INTEGER, text TEXT, read BOOLEAN DEFAULT false, created_at BIGINT)`);
     await q(`CREATE TABLE IF NOT EXISTS sessions(
       token TEXT PRIMARY KEY, user_id INTEGER, created_at BIGINT)`);
+    // 会员/置顶到期时间（毫秒时间戳；已有库平滑加列）
+    await q(`ALTER TABLE tutors ADD COLUMN IF NOT EXISTS vip_expire BIGINT DEFAULT 0`);
+    await q(`ALTER TABLE tutors ADD COLUMN IF NOT EXISTS boost_expire BIGINT DEFAULT 0`);
+    // 消息支持图片/文件（kind: text|image|file；已有库平滑加列）
+    await q(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'text'`);
+    await q(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`);
+    await q(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT`);
+    // 订单（会员 & 置顶购买）
+    await q(`CREATE TABLE IF NOT EXISTS orders(
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), type TEXT NOT NULL, plan TEXT NOT NULL,
+      amount INTEGER NOT NULL, days INTEGER NOT NULL, out_trade_no TEXT UNIQUE NOT NULL,
+      status TEXT DEFAULT 'pending', created_at BIGINT NOT NULL, paid_at BIGINT DEFAULT 0)`);
     console.log("✅ Postgres 数据表已就绪");
   },
 
@@ -182,8 +212,9 @@ module.exports = {
 
   /* 私信 */
   async createMessage(m) {
-    const row = (await q(`INSERT INTO messages(from_id,to_id,text,read,created_at) VALUES($1,$2,$3,false,$4) RETURNING *`,
-      [m.fromId, m.toId, m.text, Date.now()])).rows[0];
+    const row = (await q(`INSERT INTO messages(from_id,to_id,text,kind,file_url,file_name,read,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,false,$7) RETURNING *`,
+      [m.fromId, m.toId, m.text || "", m.kind || "text", m.fileUrl || null, m.fileName || null, Date.now()])).rows[0];
     return rowToMsg(row);
   },
   async conversations(userId) {
@@ -193,7 +224,7 @@ module.exports = {
       const other = m.fromId === userId ? m.toId : m.fromId;
       if (!map.has(other)) map.set(other, { lastAt: 0, last: "", unread: 0 });
       const c = map.get(other);
-      if (m.createdAt >= c.lastAt) { c.lastAt = m.createdAt; c.last = m.text; }
+      if (m.createdAt >= c.lastAt) { c.lastAt = m.createdAt; c.last = msgPreview(m); }
       if (m.toId === userId && !m.read) c.unread++;
     }
     const ids = [...map.keys()];
@@ -210,4 +241,32 @@ module.exports = {
     return rows.map(rowToMsg);
   },
   async unreadCount(userId) { return num((await q(`SELECT COUNT(*) FROM messages WHERE to_id=$1 AND read=false`, [userId])).rows[0].count); },
+
+  /* 订单 / 权益（会员 & 置顶） */
+  async createOrder(o) {
+    const row = (await q(`INSERT INTO orders(user_id,type,plan,amount,days,out_trade_no,status,created_at,paid_at)
+      VALUES($1,$2,$3,$4,$5,$6,'pending',$7,0) RETURNING *`,
+      [o.userId, o.type, o.plan, o.amount, o.days, o.outTradeNo, Date.now()])).rows[0];
+    return rowToOrder(row);
+  },
+  async getOrder(id) { const r = await q(`SELECT * FROM orders WHERE id=$1`, [id]); return r.rows[0] ? rowToOrder(r.rows[0]) : null; },
+  async getOrderByOutTradeNo(no) { const r = await q(`SELECT * FROM orders WHERE out_trade_no=$1`, [no]); return r.rows[0] ? rowToOrder(r.rows[0]) : null; },
+  // 标记已支付；幂等：仅当原状态为 pending 才更新，否则视为 already
+  async markOrderPaid(id) {
+    const upd = await q(`UPDATE orders SET status='paid', paid_at=$2 WHERE id=$1 AND status='pending' RETURNING *`, [id, Date.now()]);
+    if (upd.rows[0]) return { order: rowToOrder(upd.rows[0]), already: false };
+    const cur = await q(`SELECT * FROM orders WHERE id=$1`, [id]);
+    return cur.rows[0] ? { order: rowToOrder(cur.rows[0]), already: true } : null;
+  },
+  // 发放/续期：从 max(现在, 当前到期) 起叠加 days 天
+  async grantEntitlement(userId, type, days) {
+    const col = type === "vip" ? "vip_expire" : "boost_expire";
+    await q(`UPDATE tutors SET ${col}=GREATEST(COALESCE(${col},0), $2)+$3 WHERE user_id=$1`,
+      [userId, Date.now(), days * 86400000]);
+    return this.getTutor(userId);
+  },
+  async listOrders(userId) {
+    const rows = (await q(`SELECT * FROM orders WHERE user_id=$1 ORDER BY created_at DESC`, [userId])).rows;
+    return rows.map(rowToOrder);
+  },
 };
