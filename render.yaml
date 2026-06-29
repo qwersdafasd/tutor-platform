@@ -1,0 +1,29 @@
+# Render Blueprint — 自动部署家教帮
+# 推送到 GitHub 后，Render 会自动识别此文件并部署
+services:
+  - type: web
+    name: tutor-platform
+    env: node
+    region: singapore  # 新加坡节点，亚洲访问较快
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/tutors
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tutor-db
+          property: connectionString
+      - key: PGSSL
+        value: on
+      - key: PAY_PROVIDER
+        value: mock
+
+databases:
+  - name: tutor-db
+    region: singapore
+    plan: free
+    databaseName: tutor_platform
+    ipAllowList: []  # allow all (Render internal)
