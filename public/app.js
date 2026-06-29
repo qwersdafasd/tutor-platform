@@ -35,11 +35,91 @@ async function api(path, opts={}){
 }
 function needLogin(){toast("请先登录");go("#/login");}
 
+/* ============== WebSocket 实时通信 ============== */
+let socket = null;
+function connectSocket() {
+  if (socket?.connected) return;
+  if (!token()) return;
+  try {
+    socket = io({ auth: { token: token() } });
+    socket.on("connect_error", (err) => {
+      console.warn("WS 连接失败:", err.message);
+    });
+    socket.on("message:new", (msg) => {
+      // 如果在聊天页且是对应当前对话，直接追加气泡
+      const seg = (location.hash.replace(/^#\//,"")||"").split("/");
+      if (seg[0] === "chat" && seg[1] == msg.fromId) {
+        appendBubble(msg);
+      }
+      // 如果不在聊天页或不是当前对话，更新未读数
+      if (seg[0] !== "chat" || seg[1] != msg.fromId) {
+        refreshUnread();
+      }
+    });
+    socket.on("unread:update", (count) => {
+      unreadCount = count;
+      renderTabs();
+    });
+    socket.on("typing", (data) => {
+      const seg = (location.hash.replace(/^#\//,"")||"").split("/");
+      if (seg[0] === "chat" && seg[1] == data.fromId) {
+        showTyping(data.name);
+      }
+    });
+  } catch (e) {
+    console.warn("WS 初始化失败:", e);
+  }
+}
+function disconnectSocket() {
+  if (socket) { socket.disconnect(); socket = null; }
+}
+/* 聊天页追加气泡 */
+function appendBubble(msg) {
+  const chat = document.getElementById("chat");
+  if (!chat) return;
+  const u = me(); if (!u) return;
+  const side = msg.fromId === u.id ? "me" : "you";
+  let inner;
+  if (msg.kind === "image") inner = `<a href="${esc(msg.fileUrl)}" target="_blank" rel="noopener"><img class="chat-img" src="${esc(msg.fileUrl)}" alt="图片"></a>`;
+  else if (msg.kind === "file") inner = `<a class="chat-file" href="${esc(msg.fileUrl)}" target="_blank" rel="noopener" download="${esc(msg.fileName||"")}">📎 ${esc(msg.fileName||"文件")}</a>`;
+  else inner = esc(msg.text);
+  const el = document.createElement("div");
+  el.className = `bubble ${side}${msg.kind&&msg.kind!=="text"?" media":""}`;
+  el.innerHTML = inner;
+  chat.appendChild(el);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+let typingTimer = null;
+function showTyping(name) {
+  const chat = document.getElementById("chat");
+  if (!chat) return;
+  let tip = chat.querySelector(".typing-tip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.className = "typing-tip muted";
+    chat.appendChild(tip);
+  }
+  tip.textContent = `${esc(name)} 正在输入…`;
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => { if (tip) tip.textContent = ""; }, 2000);
+}
+
 /* ---------- 顶栏 ---------- */
 function setBar(title,{back=false,actions=""}={}){
   appbar.innerHTML=`${back?'<span class="back" onclick="history.back()">‹</span>':'<span class="title">家教<span class="logo-dot">帮</span></span>'}
     ${back?`<span class="title" style="font-size:16px">${esc(title)}</span>`:""}
-    <span class="right">${actions}</span>`;
+    <span class="right">${actions}${noBar?"":bellHTML()}</span>`;
+}
+let noBar=false;
+function bellHTML(){
+  const u=me();if(!u)return "";
+  const n=notifUnread||"";
+  return `<span class="iconbtn" onclick="go('#/notifications')" style="position:relative">🔔${n?`<span class="badge-dot" style="position:absolute;top:-2px;right:-4px;font-size:9px;min-width:14px;height:14px">${n>99?"99+":n}</span>`:""}</span>`;
+}
+let notifUnread=0;
+async function refreshNotifUnread(){
+  try{const {count}=await api("/notifications/unread");notifUnread=count;}catch{notifUnread=0;}
+  renderTabs();
 }
 
 /* ---------- 底部 Tab ---------- */
@@ -72,7 +152,8 @@ function tutorCard(t){
       <div class="avatar">${esc((t.name||"师")[0])}</div>
       <div style="flex:1;min-width:0">
         <div class="tutor-name">${esc(t.name||"匿名老师")}
-          ${t.vip?'<span class="vip">VIP</span>':""}${t.verified?'<span class="verified">✓认证</span>':""}${t.boosted?'<span class="boost">推广</span>':""}</div>
+          ${t.vip?'<span class="vip">VIP</span>':""}${t.verified?'<span class="verified">✓认证</span>':""}${t.boosted?'<span class="boost">推广</span>':""}
+          ${t.contacted?`<span class="contacted-tag">📩 已联系</span>`:""}</div>
         <div class="muted">${esc(t.school||"未填学校")}${t.major?" · "+esc(t.major):""}</div>
         <div class="stars">${stars(t.avg)} <span class="muted">${t.avg||"暂无"}（${t.count}）</span></div>
       </div>
@@ -96,15 +177,34 @@ async function toggleFav(id,el){
 }
 window.toggleFav=toggleFav;window.go=go;
 
+async function blockUser(id){
+  if(!confirm("确定屏蔽该用户？屏蔽后对方无法给你发消息。"))return;
+  try{await api("/block/"+id,{method:"POST"});toast("已屏蔽");}catch(e){toast(e.message);}
+}
+window.blockUser=blockUser;
+
+const STATUS_LABEL = { open: "开放中", matched: "已匹配", completed: "已完成", closed: "已关闭" };
+const STATUS_CLASS = { open: "badge-open", matched: "badge-matched", completed: "badge-completed", closed: "badge-closed" };
+
 function reqCard(r){
   const u=me();
-  return `<div class="card req-card">
-    <div class="req-top"><div class="req-subject">${esc(r.subject)} · ${esc(r.grade)}</div><span class="badge">${esc(r.mode)}</span></div>
+  const st = r.status || "open";
+  return `<div class="card req-card" onclick="go('#/request/${r.id}')">
+    <div class="req-top">
+      <div class="req-subject">${esc(r.subject)} · ${esc(r.grade)}</div>
+      <div style="display:flex;gap:4px">
+        <span class="badge ${STATUS_CLASS[st]}">${STATUS_LABEL[st]||"开放中"}</span>
+        <span class="badge">${esc(r.mode)}</span>
+      </div>
+    </div>
     <div class="muted" style="margin:6px 0">📍 ${esc(r.region||"不限")}　💰 ${esc(r.budget||"面议")}</div>
     <div>${esc(r.desc||"（无补充说明）")}</div>
     <div class="tutor-foot">
       <span class="muted">${esc(r.parentName)} · ${timeAgo(r.createdAt)}</span>
-      ${u?`<button class="btn sm ghost" onclick="go('#/chat/${r.parentId}')">私信</button>`:`<a class="muted" style="color:var(--primary)" onclick="go('#/login')">登录联系</a>`}
+      <div>
+        ${r.contacted?`<span class="contacted-tag">📩 已联系</span>`:""}
+        ${u?`<button class="btn sm ghost" onclick="event.stopPropagation();go('#/chat/${r.parentId}')">私信</button>`:`<a class="muted" style="color:var(--primary)" onclick="event.stopPropagation();go('#/login')">登录联系</a>`}
+      </div>
     </div>
   </div>`;
 }
@@ -208,7 +308,7 @@ views["tutor"]=async(id)=>{
       ${(t.tags||[]).length?`<div class="kv"><b>标签</b><div class="tags">${t.tags.map(s=>`<span class="tag">${esc(s)}</span>`).join("")}</div></div>`:""}
       <div class="kv"><b>简介</b><span>${esc(t.bio||"这位老师很神秘，还没写介绍~")}</span></div>
     </div>
-    ${u&&u.id!==t.userId?`<button class="btn block" onclick="go('#/chat/${t.userId}')">💬 私信咨询</button>`:(!u?`<button class="btn block" onclick="go('#/login')">登录后咨询/查看联系方式</button>`:"")}
+    ${u&&u.id!==t.userId?`<button class="btn block" onclick="go('#/chat/${t.userId}')">💬 私信咨询</button><button class="btn line block" style="margin-top:6px;font-size:13px;color:var(--sub)" onclick="blockUser(${t.userId})">🚫 屏蔽该老师</button>`:(!u?`<button class="btn block" onclick="go('#/login')">登录后咨询/查看联系方式</button>`:"")}
     <div class="card" style="margin-top:12px">
       <div class="section-title" style="margin-top:0">⭐ 学员评价（${t.count}）</div>
       <div id="reviews">${data.reviews.length?data.reviews.map(r=>`
@@ -274,6 +374,118 @@ views["post"]=async()=>{
     try{await api("/requests",{method:"POST",body:{subject:$("#subject").value,grade:$("#grade").value,mode,region:$("#region").value,budget:$("#budget").value,desc:$("#desc").value}});
       toast("发布成功");go("#/requests");}catch(e){$("#err").textContent=e.message;}
   };
+};
+
+/* 需求详情 */
+views["request"]=async(id)=>{
+  const u=me();
+  setBar("需求详情",{back:true});
+  view.innerHTML=`<div class="muted">加载中…</div>`;
+  let req;
+  try{const {requests}=await api("/requests");req=requests.find((r)=>r.id==id);if(!req)throw new Error("需求不存在");}
+  catch(e){view.innerHTML=`<div class="empty">${esc(e.message)}</div>`;return;}
+  const st=req.status||"open";
+  view.innerHTML=`
+    <div class="card">
+      <div class="req-top"><div class="req-subject">${esc(req.subject)} · ${esc(req.grade)}</div>
+        <div style="display:flex;gap:4px"><span class="badge ${STATUS_CLASS[st]}">${STATUS_LABEL[st]||"开放中"}</span><span class="badge">${esc(req.mode)}</span></div>
+      </div>
+      <div class="muted" style="margin:6px 0">📍 ${esc(req.region||"不限")}　💰 ${esc(req.budget||"面议")}</div>
+      <div style="margin:10px 0">${esc(req.desc||"（无补充说明）")}</div>
+      <div class="muted">发布者：${esc(req.parentName)} · ${timeAgo(req.createdAt)}</div>
+    </div>
+    <div id="reqAction"></div>`;
+  // 按钮区域
+  const actionBox=$("#reqAction");
+  if(!u){actionBox.innerHTML=`<button class="btn block" onclick="go('#/login')">登录后申请/联系</button>`;return;}
+
+  // 老师：申请接单
+  if(u.role==="tutor"&&st==="open"){
+    actionBox.innerHTML=`
+      <div class="card">
+        <label>给家长留言（可选）</label><textarea id="appMsg" placeholder="简单介绍自己、辅导经验等"></textarea>
+        <div class="err" id="appErr"></div>
+        <button class="btn block" id="appBtn">📩 申请接单</button>
+        <div class="muted" style="margin-top:8px;text-align:center">也可以先 <a style="color:var(--primary);font-weight:600;cursor:pointer" onclick="go('#/chat/${req.parentId}')">私信聊一聊</a></div>
+      </div>`;
+    $("#appBtn").onclick=async()=>{
+      $("#appErr").textContent="";const btn=$("#appBtn");btn.disabled=true;btn.textContent="提交中…";
+      try{await api("/requests/"+id+"/apply",{method:"POST",body:{message:$("#appMsg").value}});toast("申请已发送，等待家长确认 🙌");render();}
+      catch(e){$("#appErr").textContent=e.message;btn.disabled=false;btn.textContent="📩 申请接单";}
+    };
+  }
+  // 家长或管理员：查看申请列表
+  const isOwnerOrAdmin=u.role==="admin"||(u.role==="parent"&&req.parentId===u.id);
+  if(isOwnerOrAdmin){
+    try{
+      const {applications}=await api("/requests/"+id+"/applications");
+      actionBox.innerHTML+=`
+        <div class="section-title">👥 申请接单的老师（${applications.length}）</div>
+        <div id="appList"></div>`;
+      const listEl=$("#appList");
+      if(!applications.length){listEl.innerHTML=`<div class="empty">还没有老师申请</div>`;}else{
+        listEl.innerHTML=applications.map(a=>`
+          <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div><b>${esc(a.tutorName)}</b> ${a.tutorVerified?`<span class="verified">✓认证</span>`:""} <span class="muted">${esc(a.tutorSchool)}</span></div>
+              <span class="badge ${a.status==="approved"?"badge-matched":a.status==="rejected"?"badge-closed":"badge-open"}">${a.status==="approved"?"已通过":a.status==="rejected"?"已拒绝":"待审核"}</span>
+            </div>
+            ${a.message?`<div class="muted" style="margin-top:4px">留言：${esc(a.message)}</div>`:""}
+            <div class="muted" style="margin-top:4px">${timeAgo(a.createdAt)}</div>
+            ${a.status==="pending"?`
+              <div style="display:flex;gap:8px;margin-top:10px">
+                <button class="btn sm block" id="appr${a.id}">✓ 通过</button>
+                <button class="btn sm block line" id="rej${a.id}">✗ 拒绝</button>
+              </div>`:""}
+          </div>`).join("");
+        applications.filter(a=>a.status==="pending").forEach(a=>{
+          $("#appr"+a.id).onclick=async()=>{
+            try{await api("/applications/"+a.id+"/approve",{method:"POST"});toast("已通过，该老师将收到通知 🎉");render();}
+            catch(e){toast(e.message);}
+          };
+          $("#rej"+a.id).onclick=async()=>{
+            try{await api("/applications/"+a.id+"/reject",{method:"POST"});toast("已拒绝");render();}
+            catch(e){toast(e.message);}
+          };
+        });
+      }
+      // 状态操作按钮
+      if(["open","matched"].includes(st)&&req.parentId===u.id||u.role==="admin"){
+        actionBox.innerHTML+=`<div style="display:flex;gap:8px;margin-top:10px">
+          ${st==="matched"?`<button class="btn sm block ghost" id="completeBtn">✓ 标记已完成</button>`:""}
+          <button class="btn sm block line" id="closeBtn">${st==="open"?"✕ 关闭需求":"✕ 关闭"}</button>
+        </div>`;
+        const cb=$("#completeBtn");if(cb)cb.onclick=async()=>{
+          try{await api("/requests/"+id+"/status",{method:"PATCH",body:{status:"completed"}});toast("已标记完成");render();}catch(e){toast(e.message);}
+        };
+        $("#closeBtn").onclick=async()=>{
+          try{await api("/requests/"+id+"/status",{method:"PATCH",body:{status:"closed"}});toast("已关闭");render();}catch(e){toast(e.message);}
+        };
+      }
+    }catch(e){console.warn(e);}
+  }else{
+    // 其他用户：显示私信按钮
+    if(u.id!==req.parentId)actionBox.innerHTML+=`<button class="btn block" onclick="go('#/chat/${req.parentId}')">💬 私信发布者</button>`;
+  }
+  // 关联订单（已匹配/已完成/已关闭时）
+  if(st!=="open"&&u){
+    try{
+      const {order}=await api("/requests/"+id+"/order");
+      if(order){
+        const isTutor=u.id===order.tutorId, isParent=u.id===order.parentId;
+        const peerName=isTutor?(order.parentName||"家长"):(order.tutorName||"老师");
+        const stLabel=ORDER_STATUS_LABEL[order.status]||order.status;
+        actionBox.innerHTML+=`<div class="card" style="border-left:3px solid var(--ok)">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-weight:700">📋 关联订单</span>
+            <span class="badge ${ORDER_STATUS_CLASS[order.status]||""}">${stLabel}</span>
+          </div>
+          <div class="muted" style="margin:6px 0">${isTutor?"家长":"老师"}：${esc(peerName)}</div>
+          <button class="btn sm block" onclick="go('#/order/${order.id}')">查看订单详情 ›</button>
+        </div>`;
+      }
+    }catch{}
+  }
 };
 
 /* 老师档案 */
@@ -432,12 +644,13 @@ views["messages"]=async()=>{
 views["chat"]=async(uid)=>{
   const u=me();if(!u)return needLogin();
   setBar("聊天",{back:true});
-  view.innerHTML=`<div class="chat" id="chat"><div class="muted">加载中…</div></div>
+  view.innerHTML=`<input id="searchMsg" class="chat-search" placeholder="🔍 搜索聊天记录…">
+    <div class="chat" id="chat"><div class="muted">加载中…</div></div>
     <div class="chat-input">
       <label class="attach" title="发送图片/文件">📎<input type="file" id="file" hidden></label>
       <input id="msg" placeholder="输入消息…"><button class="btn" id="send">发送</button>
     </div>`;
-  // 一条消息渲染成气泡：图片→缩略图，文件→下载链接，文字→转义文本
+  let allMessages=[];
   function bubble(m){
     const side=m.fromId===u.id?"me":"you";
     let inner;
@@ -446,20 +659,40 @@ views["chat"]=async(uid)=>{
     else inner=esc(m.text);
     return `<div class="bubble ${side}${m.kind&&m.kind!=="text"?" media":""}">${inner}</div>`;
   }
+  function filterMessages(kw){
+    const c=$("#chat");if(!c)return;
+    if(!kw){c.innerHTML=allMessages.map(bubble).join("");window.scrollTo(0,document.body.scrollHeight);return;}
+    const k=kw.toLowerCase();
+    const hit=allMessages.filter(m=>m.kind==="text"&&(m.text||"").toLowerCase().includes(k));
+    c.innerHTML=hit.length?hit.map(bubble).join(""):`<div class="empty">未找到包含「${esc(kw)}」的消息</div>`;
+  }
   async function load(){
     try{const {messages,peer}=await api("/messages/"+uid);
+      allMessages=messages;
       setBar(peer.name+(peer.role==="tutor"?"（老师）":"（家长）"),{back:true});
       const c=$("#chat");
       c.innerHTML=messages.length?messages.map(bubble).join(""):`<div class="empty">开始聊天吧~</div>`;
       window.scrollTo(0,document.body.scrollHeight);
       refreshUnread();
+      // 通过 WS 标记已读
+      if(socket?.connected) socket.emit("message:read", uid);
     }catch(e){$("#chat").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
   }
   async function send(){
     const text=$("#msg").value.trim();if(!text)return;
     $("#msg").value="";
-    try{await api("/messages",{method:"POST",body:{toId:+uid,text}});await load();}
-    catch(e){toast(e.message);}
+    // 优先走 WebSocket
+    if(socket?.connected){
+      socket.emit("message:send", {toId:+uid,text}, (resp)=>{
+        if(resp?.error) return toast(resp.error);
+        // ws 推送会自动追加气泡，但第一次加载需要确保本地有
+        if(!resp?.message) load();
+      });
+    } else {
+      // HTTP 降级
+      try{await api("/messages",{method:"POST",body:{toId:+uid,text}});await load();}
+      catch(e){toast(e.message);}
+    }
   }
   async function sendFile(file){
     if(!file)return;
@@ -468,14 +701,275 @@ views["chat"]=async(uid)=>{
     try{
       toast("上传中…");
       const up=await api("/upload",{method:"POST",body:{dataUrl,name:file.name}});
-      await api("/messages",{method:"POST",body:{toId:+uid,kind:up.kind,fileUrl:up.url,fileName:up.name}});
-      await load();
+      // 图片/文件通过 WS 发送
+      if(socket?.connected){
+        socket.emit("message:send", {toId:+uid,kind:up.kind,fileUrl:up.url,fileName:up.name}, (resp)=>{
+          if(resp?.error) toast(resp.error);
+        });
+      } else {
+        await api("/messages",{method:"POST",body:{toId:+uid,kind:up.kind,fileUrl:up.url,fileName:up.name}});
+        await load();
+      }
     }catch(e){toast(e.message);}
   }
   $("#send").onclick=send;
   $("#msg").addEventListener("keydown",e=>{if(e.key==="Enter")send();});
+  // 键入时发送 typing 事件
+  $("#msg").addEventListener("input",()=>{
+    if(socket?.connected && $("#msg").value.trim()) {
+      socket.emit("typing", +uid);
+    }
+  });
+  // 消息搜索
+  const searchEl=$("#searchMsg");
+  if(searchEl)searchEl.addEventListener("input",()=>{
+    const kw=searchEl.value.trim();
+    if(!kw){load();return;}
+    const c=$("#chat");if(!c)return;
+    const hit=allMessages.filter(m=>m.kind==="text"&&(m.text||"").toLowerCase().includes(kw.toLowerCase()));
+    c.innerHTML=hit.length?hit.map(bubble).join(""):`<div class="empty">未找到包含「${esc(kw)}」的消息</div>`;
+  });
   $("#file").onchange=e=>{const f=e.target.files[0];e.target.value="";sendFile(f);};
   load();
+};
+
+/* ============== 订单列表 ============== */
+const ORDER_STATUS_LABEL = { teaching: "授课中", completed: "已完成", cancelled: "已取消" };
+const ORDER_STATUS_CLASS = { teaching: "badge-matched", completed: "badge-completed", cancelled: "badge-closed" };
+
+function orderCard(o) {
+  const u = me();
+  const isTutor = u && u.id === o.tutorId;
+  const peerName = isTutor ? (o.parentName || "家长") : (o.tutorName || "老师");
+  return `<div class="card" onclick="go('#/order/${o.id}')">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div class="req-subject">${esc(o.subject)} · ${esc(o.grade)}</div>
+      <span class="badge ${ORDER_STATUS_CLASS[o.status]||""}">${ORDER_STATUS_LABEL[o.status]||o.status}</span>
+    </div>
+    <div class="muted" style="margin:6px 0">
+      ${isTutor?"👨‍👩‍👧 家长":"🧑‍🏫 老师"}：${esc(peerName)} · ${esc(o.mode||"")} · ${esc(o.region||"不限")}
+    </div>
+    <div class="tutor-foot">
+      <span class="muted">📅 ${fmtDate(o.createdAt)}</span>
+      ${o.status==="completed"?`<span class="muted">✓ 完成于 ${fmtDate(o.completedAt)}</span>`:o.status==="teaching"?`<span class="price">进行中</span>`:""}
+    </div>
+  </div>`;
+}
+
+views["orders"]=async()=>{
+  const u=me();if(!u)return needLogin();
+  setBar("我的订单",{back:true});
+  view.innerHTML=`<div id="list"><div class="muted">加载中…</div></div>`;
+  try{
+    const {orders}=await api("/orders");
+    const list=$("#list");
+    if(!orders.length){list.innerHTML=`<div class="empty">还没有订单<br>匹配成功后会自动生成</div>`;return;}
+    list.innerHTML=orders.map(orderCard).join("");
+  }catch(e){$("#list").innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+};
+
+/* 订单详情 */
+views["order"]=async(id)=>{
+  const u=me();if(!u)return needLogin();
+  setBar("订单详情",{back:true});
+  view.innerHTML=`<div class="muted">加载中…</div>`;
+  let o;
+  try{const {order}=await api("/orders/"+id);o=order;}catch(e){view.innerHTML=`<div class="empty">${esc(e.message)}</div>`;return;}
+  const isTutor=u.id===o.tutorId, isParent=u.id===o.parentId;
+  const peerName=isTutor?(o.parentName||"家长"):(o.tutorName||"老师");
+  const st=o.status||"teaching";
+  view.innerHTML=`
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div class="req-subject">${esc(o.subject)} · ${esc(o.grade)}</div>
+        <span class="badge ${ORDER_STATUS_CLASS[st]}">${ORDER_STATUS_LABEL[st]||st}</span>
+      </div>
+      <div class="kv"><b>科目</b>${esc(o.subject)}</div>
+      <div class="kv"><b>年级</b>${esc(o.grade)}</div>
+      <div class="kv"><b>方式</b>${esc(o.mode||"不限")}</div>
+      <div class="kv"><b>地区</b>${esc(o.region||"不限")}</div>
+      <div class="kv"><b>${isTutor?"家长":"老师"}</b>${esc(peerName)} ${isParent&&!isTutor?`<a style="color:var(--primary);font-weight:600;cursor:pointer" onclick="go('#/tutor/${o.tutorId}')">查看主页</a>`:isTutor?`<a style="color:var(--primary);font-weight:600;cursor:pointer" onclick="go('#/chat/${o.parentId}')">发消息</a>`:""}</div>
+      <div class="kv"><b>创建时间</b>${fmtDate(o.createdAt)}</div>
+      ${o.completedAt?`<div class="kv"><b>完成时间</b>${fmtDate(o.completedAt)}</div>`:""}
+    </div>
+    <div id="orderActions"></div>`;
+  const act=$("#orderActions");
+  if(st==="teaching"&&(isParent||isTutor||u.role==="admin")){
+    act.innerHTML=`
+      <div class="card">
+        <button class="btn block ghost" id="completeOrderBtn">✓ 标记已完成</button>
+        <button class="btn block line" style="margin-top:10px" id="cancelOrderBtn">✕ 取消订单</button>
+      </div>`;
+    $("#completeOrderBtn").onclick=async()=>{
+      try{await api("/orders/"+id+"/status",{method:"PATCH",body:{status:"completed"}});toast("订单已完成 🎉");render();}catch(e){toast(e.message);}
+    };
+    $("#cancelOrderBtn").onclick=async()=>{
+      if(!confirm("确定取消这个订单？"))return;
+      try{await api("/orders/"+id+"/status",{method:"PATCH",body:{status:"cancelled"}});toast("订单已取消");render();}catch(e){toast(e.message);}
+    };
+  }
+  // 联系对方按钮
+  if(isTutor)act.innerHTML+=`<button class="btn block" style="margin-top:10px" onclick="go('#/chat/${o.parentId}')">💬 联系家长</button>`;
+  else if(isParent)act.innerHTML+=`<button class="btn block" style="margin-top:10px" onclick="go('#/chat/${o.tutorId}')">💬 联系老师</button>`;
+  // 完成后老师可评价家长（双向评价）
+  if(st==="completed"&&isTutor){
+    act.innerHTML+=`<div class="card" style="margin-top:10px">
+      <label>评价家长（出勤、配合度）</label>
+      <div id="starPickParent">${[1,2,3,4,5].map(i=>`<span class="star-pick" data-v="${i}">★</span>`).join("")}</div>
+      <textarea id="pComment" placeholder="对这位家长的评价…"></textarea>
+      <div class="err" id="pErr"></div><button class="btn block" id="pBtn">提交评价</button>
+    </div>`;
+    let pRating=0;
+    $$("#starPickParent .star-pick").forEach(p=>p.onclick=()=>{pRating=+p.dataset.v;$$("#starPickParent .star-pick").forEach(x=>x.classList.toggle("on",+x.dataset.v<=pRating));});
+    $("#pBtn").onclick=async()=>{
+      $("#pErr").textContent="";if(!pRating){$("#pErr").textContent="请先打分";return;}
+      try{await api("/parents/"+o.parentId+"/reviews",{method:"POST",body:{rating:pRating,comment:$("#pComment").value,orderId:o.id}});toast("评价成功");$("#pBtn").disabled=true;}catch(e){$("#pErr").textContent=e.message;}
+    };
+  }
+  // 课程表（课时记录）
+  (async()=>{
+    try{
+      const {lessons}=await api("/orders/"+id+"/lessons");
+      act.innerHTML+=`<div class="section-title" style="margin-top:16px">📅 课程表（${lessons.length}课时）</div><div id="lessonList"></div>`;
+      const listEl=$("#lessonList");
+      if(!lessons.length){listEl.innerHTML=`<div class="empty">暂无课时记录</div>`;}else{
+        listEl.innerHTML=lessons.map(l=>{
+          const ls=l.status||"scheduled";
+          return `<div class="card" style="border-left:3px solid ${ls==='completed'?'var(--ok)':ls==='cancelled'?'var(--sub)':'var(--primary)'};padding:10px 14px">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div style="font-weight:600;font-size:14px">${esc(l.title||"课时")}</div>
+              <span class="badge ${ls==='completed'?'badge-completed':ls==='cancelled'?'badge-closed':'badge-open'}">${ls==='completed'?'已完成':ls==='cancelled'?'已取消':'待上课'}</span>
+            </div>
+            <div class="muted" style="margin:4px 0">📅 ${l.startTime?new Date(l.startTime).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}):"—"}${l.endTime?` — ${new Date(l.endTime).toLocaleString("zh-CN",{hour:"2-digit",minute:"2-digit"})}`:""}</div>
+            ${l.notes?`<div class="muted">📝 ${esc(l.notes)}</div>`:""}
+            ${st==="teaching"&&ls==="scheduled"?`<div style="display:flex;gap:6px;margin-top:6px"><button class="btn xs ghost" data-lesson="${l.id}" data-to="completed">✓ 已完成</button><button class="btn xs line" data-lesson="${l.id}" data-to="cancelled">✕ 取消</button></div>`:""}
+          </div>`;
+        }).join("");
+        // 标记课时完成/取消
+        $$("[data-lesson]").forEach(b=>b.onclick=async()=>{
+          try{await api("/lessons/"+b.dataset.lesson+"/status",{method:"PATCH",body:{status:b.dataset.to}});toast("已更新");render();}catch(e){toast(e.message);}
+        });
+      }
+      // 添加课时按钮（授课中）
+      if(st==="teaching"&&(isTutor||isParent||u.role==="admin")){
+        act.innerHTML+=`
+          <div class="card">
+            <div class="section-title" style="margin-top:0;font-size:14px">➕ 添加课时</div>
+            <label>上课时间</label><input id="lsStart" type="datetime-local">
+            <label>结束时间（可选）</label><input id="lsEnd" type="datetime-local">
+            <label>标题</label><input id="lsTitle" placeholder="如 第1课" value="第${lessons.length+1}课">
+            <label>备注</label><textarea id="lsNotes" placeholder="上课内容、作业等"></textarea>
+            <div class="err" id="lsErr"></div>
+            <button class="btn block" id="lsBtn">添加课时</button>
+          </div>`;
+        $("#lsBtn").onclick=async()=>{
+          $("#lsErr").textContent="";
+          const startVal=$("#lsStart").value;
+          if(!startVal){$("#lsErr").textContent="请选择上课时间";return;}
+          const startTime=new Date(startVal).getTime();
+          const endVal=$("#lsEnd").value;
+          const endTime=endVal?new Date(endVal).getTime():0;
+          try{
+            await api("/orders/"+id+"/lessons",{method:"POST",body:{title:$("#lsTitle").value,startTime,endTime,notes:$("#lsNotes").value}});
+            toast("课时已添加 📅");render();
+          }catch(e){$("#lsErr").textContent=e.message;}
+        };
+      }
+    }catch(e){console.warn("课时加载失败:",e);}
+  })();
+};
+
+/* 通知中心 */
+views["notifications"]=async()=>{
+  const u=me();if(!u)return needLogin();
+  setBar("通知中心",{back:true});
+  view.innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span class="section-title" style="margin:0">🔔 最近通知</span>
+      <button class="btn sm ghost" id="readAllBtn">全部标为已读</button>
+    </div>
+    <div id="list"><div class="muted">加载中…</div></div>`;
+  const list=$("#list");
+  try{
+    const {notifications}=await api("/notifications");
+    if(!notifications.length){list.innerHTML=`<div class="empty">暂无通知</div>`;return;}
+    list.innerHTML=notifications.map(n=>`
+      <div class="card" style="display:flex;gap:12px;align-items:flex-start;cursor:pointer;${n.read?"opacity:.7":""}" data-id="${n.id}">
+        <div style="flex:1">
+          <div style="font-weight:${n.read?"400":"700"};font-size:14px">${esc(n.title)}</div>
+          <div class="muted" style="margin:2px 0">${esc(n.body||"")}</div>
+          <div class="muted" style="font-size:11px">${timeAgo(n.createdAt)}</div>
+        </div>
+        ${n.read?"":`<span class="undot" style="flex-shrink:0"></span>`}
+      </div>`).join("");
+    $$("#list .card").forEach(el=>el.onclick=async()=>{
+      try{await api("/notifications/"+el.dataset.id+"/read",{method:"POST"});el.style.opacity=".7";el.querySelector(".undot")?.remove();}catch{}
+    });
+    $("#readAllBtn").onclick=async()=>{
+      try{await api("/notifications/read-all",{method:"POST"});render();}catch(e){toast(e.message);}
+    };
+  }catch(e){list.innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
+};
+
+/* 修改密码 */
+views["change-password"]=async()=>{
+  const u=me();if(!u)return needLogin();
+  setBar("修改密码",{back:true});
+  view.innerHTML=`<div class="card">
+    <label>当前密码</label>
+    <div class="field"><span class="field-ico">🔒</span><input id="oldPwd" type="password" placeholder="输入当前密码"></div>
+    <label>新密码</label>
+    <div class="field"><span class="field-ico">🔑</span><input id="newPwd" type="password" placeholder="至少 4 位"></div>
+    <label>确认新密码</label>
+    <div class="field"><span class="field-ico">🔑</span><input id="confirmPwd" type="password" placeholder="再次输入新密码"></div>
+    <div class="err" id="pwErr"></div>
+    <button class="auth-btn" id="pwBtn">修改密码</button>
+  </div>`;
+  $("#pwBtn").onclick=async()=>{
+    $("#pwErr").textContent="";
+    const old=$("#oldPwd").value, pwd=$("#newPwd").value, confirm=$("#confirmPwd").value;
+    if(!old||!pwd){$("#pwErr").textContent="请填写完整";return;}
+    if(pwd!==confirm){$("#pwErr").textContent="两次密码不一致";return;}
+    if(pwd.length<4){$("#pwErr").textContent="新密码至少 4 位";return;}
+    try{await api("/change-password",{method:"POST",body:{oldPassword:old,newPassword:pwd}});toast("密码已修改 🔑");go("#/me");}
+    catch(e){$("#pwErr").textContent=e.message;}
+  };
+};
+
+/* 沟通偏好 */
+views["prefs"]=async()=>{
+  const u=me();if(!u)return needLogin();
+  setBar("沟通偏好",{back:true});
+  view.innerHTML=`<div class="muted">加载中…</div>`;
+  let prefs;
+  try{
+    const {prefs: p}=await api("/prefs");prefs=p;
+    const {ids}=await api("/blocked");
+    view.innerHTML=`
+      <div class="card">
+        <div class="section-title" style="margin-top:0">🔇 免打扰时段</div>
+        <p class="muted">设置后，该时段内不会收到通知提醒</p>
+        <div class="row"><div><label>开始</label><input id="qStart" type="time" value="${esc(prefs.quietStart||"")}"></div>
+        <div><label>结束</label><input id="qEnd" type="time" value="${esc(prefs.quietEnd||"")}"></div></div>
+        <div class="err" id="prefErr"></div>
+        <button class="btn block" id="prefBtn">保存偏好</button>
+      </div>
+      <div class="card">
+        <div class="section-title" style="margin-top:0">🚫 已屏蔽用户 (${ids.length})</div>
+        <div id="blockedList">${ids.length?"加载中…":`<span class="muted">暂无屏蔽</span>`}</div>
+      </div>`;
+    if(ids.length){
+      const listEl=$("#blockedList");
+      listEl.innerHTML=ids.map(id=>`<div class="conv"><div class="meta">用户 #${id}</div><button class="btn xs line" data-uid="${id}">取消屏蔽</button></div>`).join("");
+      $$("#blockedList [data-uid]").forEach(b=>b.onclick=async()=>{
+        try{await api("/unblock/"+b.dataset.uid,{method:"POST"});toast("已取消屏蔽");render();}catch(e){toast(e.message);}
+      });
+    }
+    $("#prefBtn").onclick=async()=>{
+      $("#prefErr").textContent="";
+      try{await api("/prefs",{method:"PUT",body:{quietStart:$("#qStart").value,quietEnd:$("#qEnd").value}});toast("偏好已保存");}catch(e){$("#prefErr").textContent=e.message;}
+    };
+  }catch(e){view.innerHTML=`<div class="empty">${esc(e.message)}</div>`;}
 };
 
 /* 我的 */
@@ -500,12 +994,16 @@ views["me"]=async()=>{
       `:`
         <div class="conv" onclick="go('#/post')"><span style="font-size:20px">📋</span><div class="meta">发布需求</div><span>›</span></div>
       `}
+      <div class="conv" onclick="go('#/orders')"><span style="font-size:20px">📋</span><div class="meta">我的订单<span class="mini-tip">授课记录</span></div><span>›</span></div>
+      <div class="conv" onclick="go('#/notifications')"><span style="font-size:20px">🔔</span><div class="meta">通知中心</div><span>›</span></div>
       <div class="conv" onclick="go('#/favorites')"><span style="font-size:20px">♥</span><div class="meta">我的收藏</div><span>›</span></div>
       <div class="conv" onclick="go('#/messages')"><span style="font-size:20px">💬</span><div class="meta">我的消息</div><span>›</span></div>
+      <div class="conv" onclick="go('#/prefs')"><span style="font-size:20px">⚙️</span><div class="meta">沟通偏好</div><span>›</span></div>
+      <div class="conv" onclick="go('#/change-password')"><span style="font-size:20px">🔑</span><div class="meta">修改密码</div><span>›</span></div>
       `}
     </div>
     <button class="btn line block" id="logout">退出登录</button>`;
-  $("#logout").onclick=async()=>{try{await api("/logout",{method:"POST"});}catch{}clearAuth();toast("已退出");go("#/");refreshUnread();};
+  $("#logout").onclick=async()=>{try{await api("/logout",{method:"POST"});}catch{}clearAuth();disconnectSocket();notifUnread=0;toast("已退出");go("#/");refreshUnread();};
 };
 
 /* 管理后台（仅 admin） */
@@ -726,7 +1224,7 @@ views["login"]=async()=>{
       try{let d;
         if(mode==="login")d=await api("/login",{method:"POST",body:{phone,password}});
         else d=await api("/register",{method:"POST",body:{name:$("#name").value.trim(),phone,password,role}});
-        setAuth(d.token,d.user);toast(mode==="login"?"登录成功":"注册成功");refreshUnread();
+        setAuth(d.token,d.user);toast(mode==="login"?"登录成功":"注册成功");refreshUnread();refreshNotifUnread();connectSocket();
         go(d.user.role==="tutor"?"#/profile":"#/tutors");
       }catch(e){$("#err").textContent=e.message;btn.disabled=false;btn.textContent=mode==="login"?"登 录":"注 册";}
     };
@@ -745,6 +1243,7 @@ async function render(){
   const [seg,arg]=hash.split("/");
   const v=views[seg]||views[""];
   // 登录页独立全屏：隐藏顶栏和底部导航
+  noBar = seg==="login";
   document.body.classList.toggle("auth-mode", seg==="login");
   // 聊天页为二级页：隐藏底部导航，让输入框能贴底显示（否则被 tab 栏盖住）
   document.body.classList.toggle("chat-mode", seg==="chat");
@@ -754,4 +1253,6 @@ async function render(){
 }
 window.addEventListener("hashchange",render);
 refreshUnread();
+refreshNotifUnread();
+connectSocket();
 render();

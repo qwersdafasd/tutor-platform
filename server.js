@@ -4,13 +4,20 @@
  */
 require("dotenv").config();
 const express = require("express");
+const http = require("http");
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
+const { Server: SocketIOServer } = require("socket.io");
 const store = require("./store");
 const pay = require("./pay");
 
 const app = express();
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: { origin: "*" },
+  maxHttpBufferSize: 1e6,
+});
 const PORT = process.env.PORT || 5200;
 
 // 上传目录（聊天图片/文件存这里，由 express.static 直接托管为 /uploads/xxx）
@@ -53,12 +60,19 @@ function verifyPwd(pwd, stored) {
 
 /* ============== 鉴权 ============== */
 const tokenOf = (req) => (req.headers.authorization || "").replace("Bearer ", "");
+const tokenOfWS = (auth) => (auth?.token || "").replace("Bearer ", "");
 
 // 登录态内存缓存：token -> {user, exp}。命中则免去每请求 2 次数据库查询（性能关键）。
 // TTL 30 秒；退出登录 / 封禁 / 改角色 / 删用户时主动清缓存，保证及时生效。
 const SESSION_TTL = 30000;
 const sessionCache = new Map();
+const wsUserMap = new Map(); // socketId -> userId
 function cacheClear(token) { if (token) sessionCache.delete(token); else sessionCache.clear(); }
+function wsUserLeave(userId) {
+  for (const [sid, uid] of wsUserMap) {
+    if (uid === userId) { wsUserMap.delete(sid); break; }
+  }
+}
 // 按 token 解析出用户（先查缓存，未命中再查库并回填）。找不到返回 null。
 async function resolveUser(token) {
   if (!token) return null;
@@ -116,14 +130,15 @@ app.post("/api/login", wrap(async (req, res) => {
   res.json({ token, user: publicUser(user) });
 }));
 
-app.post("/api/logout", auth, wrap(async (req, res) => { const t = tokenOf(req); await store.deleteSession(t); cacheClear(t); res.json({ ok: true }); }));
+app.post("/api/logout", auth, wrap(async (req, res) => { const t = tokenOf(req); await store.deleteSession(t); cacheClear(t); wsUserLeave(req.user.id); res.json({ ok: true }); }));
 app.get("/api/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
 /* ============== 老师 ============== */
 app.get("/api/tutors", optionalAuth, wrap(async (req, res) => {
   const tutors = await store.listTutors(req.query);
   const favIds = new Set(req.user ? await store.favoriteIds(req.user.id) : []);
-  const out = tutors.map((t) => ({ ...t, faved: favIds.has(t.userId) }));
+  const contactedIds = new Set(req.user ? await store.contactedUserIds(req.user.id) : []);
+  const out = tutors.map((t) => ({ ...t, faved: favIds.has(t.userId), contacted: contactedIds.has(t.userId) }));
   const w = (t) => (t.boosted ? 2 : 0) + (t.vip ? 1 : 0); // 置顶优先、其次会员
   out.sort((a, b) => (w(b) - w(a)) || (b.avg - a.avg) || (b.count - a.count));
   res.json({ tutors: out });
@@ -222,7 +237,14 @@ app.post("/api/billing/notify", wrap(async (req, res) => {
 
 /* ============== 家长需求 ============== */
 app.get("/api/requests", optionalAuth, wrap(async (req, res) => {
-  res.json({ requests: await store.listRequests(req.query) });
+  const requests = await store.listRequests(req.query);
+  // 如果已登录，补充当前用户是否联系过发布者
+  if (req.user) {
+    const contacted = await store.contactedUserIds(req.user.id);
+    const set = new Set(contacted);
+    requests.forEach((r) => r.contacted = set.has(r.parentId));
+  }
+  res.json({ requests });
 }));
 
 app.post("/api/requests", auth, wrap(async (req, res) => {
@@ -236,15 +258,226 @@ app.post("/api/requests", auth, wrap(async (req, res) => {
   res.json({ request });
 }));
 
-/* ============== 评价 ============== */
+// 修改需求状态（家长：完成/关闭；管理员：任意）
+app.patch("/api/requests/:id/status", auth, wrap(async (req, res) => {
+  const id = +req.params.id, { status } = req.body || {};
+  const valid = ["completed", "closed"];
+  if (req.user.role === "admin") valid.push("open", "matched");
+  if (!valid.includes(status)) return res.status(400).json({ error: "状态无效" });
+  const request = await store.getRequest(id);
+  if (!request) return res.status(404).json({ error: "需求不存在" });
+  if (req.user.role !== "admin" && request.parentId !== req.user.id)
+    return res.status(403).json({ error: "无权修改此需求" });
+  await store.setRequestStatus(id, status);
+  res.json({ ok: true, status });
+}));
+
+// 老师申请接单
+app.post("/api/requests/:id/apply", auth, wrap(async (req, res) => {
+  if (req.user.role !== "tutor") return res.status(403).json({ error: "仅老师可申请接单" });
+  const requestId = +req.params.id;
+  const { message } = req.body || {};
+  // 检查需求存在且状态为 open
+  const req2 = await store.getRequest(requestId);
+  if (!req2) return res.status(404).json({ error: "需求不存在" });
+  if (req2.status !== "open") return res.status(400).json({ error: "该需求已停止接受申请" });
+  // 检查是否已申请过
+  const apps = await store.listApplications(requestId);
+  if (apps.some((a) => a.tutorId === req.user.id && a.status === "pending"))
+    return res.status(400).json({ error: "你已经申请过了，等待家长确认" });
+  const app = await store.createApplication({ requestId, tutorId: req.user.id, message: message || "" });
+  notify(req2.parentId, "new_application", `${req.user.name} 申请接单`, `科目：${req2.subject}·${req2.grade}`, requestId);
+  res.json({ application: app });
+}));
+
+// 查看需求的申请列表（仅家长/管理员）
+app.get("/api/requests/:id/applications", auth, wrap(async (req, res) => {
+  const requestId = +req.params.id;
+  const req2 = await store.getRequest(requestId);
+  if (!req2) return res.status(404).json({ error: "需求不存在" });
+  if (req.user.role !== "admin" && req2.parentId !== req.user.id)
+    return res.status(403).json({ error: "无权查看" });
+  const applications = await store.listApplications(requestId);
+  res.json({ applications });
+}));
+
+// 家长通过申请
+app.post("/api/applications/:id/approve", auth, wrap(async (req, res) => {
+  const app = await store.getApplication(+req.params.id);
+  if (!app) return res.status(404).json({ error: "申请不存在" });
+  const req2 = await store.getRequest(app.requestId);
+  if (!req2) return res.status(404).json({ error: "需求不存在" });
+  if (req.user.role !== "admin" && req2.parentId !== req.user.id)
+    return res.status(403).json({ error: "无权操作" });
+  if (app.status !== "pending") return res.status(400).json({ error: "该申请已处理" });
+  const result = await store.approveApplication(app.id);
+  // 通过时自动创建订单
+  if (result && result.status === "approved") {
+    try {
+      const order = await store.createTeacherOrder({
+        requestId: app.requestId, tutorId: app.tutorId, parentId: req2.parentId,
+        subject: req2.subject, grade: req2.grade, mode: req2.mode || "", region: req2.region || "", hourlyRate: 0,
+      });
+      notify(app.tutorId, "application_approved", "申请已通过", `家长已通过你的申请：「${req2.subject}·${req2.grade}」`, order?.id);
+    } catch (e) { console.error("创建订单失败:", e); }
+  }
+  res.json({ application: result });
+}));
+
+// 家长拒绝申请
+app.post("/api/applications/:id/reject", auth, wrap(async (req, res) => {
+  const app = await store.getApplication(+req.params.id);
+  if (!app) return res.status(404).json({ error: "申请不存在" });
+  const req2 = await store.getRequest(app.requestId);
+  if (!req2) return res.status(404).json({ error: "需求不存在" });
+  if (req.user.role !== "admin" && req2.parentId !== req.user.id)
+    return res.status(403).json({ error: "无权操作" });
+  const result = await store.rejectApplication(app.id);
+  res.json({ application: result });
+}));
+
+// 已联系过的用户 ID 列表
+app.get("/api/contacted/ids", auth, wrap(async (req, res) => {
+  res.json({ ids: await store.contactedUserIds(req.user.id) });
+}));
+
+/* ============== 订单记录 ============== */
+app.get("/api/orders", auth, wrap(async (req, res) => {
+  const orders = await store.listTeacherOrders(req.user.id);
+  res.json({ orders });
+}));
+
+app.get("/api/orders/:id", auth, wrap(async (req, res) => {
+  const order = await store.getTeacherOrder(+req.params.id);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权查看" });
+  res.json({ order });
+}));
+
+app.patch("/api/orders/:id/status", auth, wrap(async (req, res) => {
+  const order = await store.getTeacherOrder(+req.params.id);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.parentId !== req.user.id && order.tutorId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权操作" });
+  const { status } = req.body || {};
+  if (!["completed", "cancelled"].includes(status)) return res.status(400).json({ error: "状态无效" });
+  // 把对应需求也同步为完成/关闭
+  await store.updateTeacherOrderStatus(order.id, status);
+  try { await store.setRequestStatus(order.requestId, status === "completed" ? "completed" : "closed"); } catch {}
+  const updated = await store.getTeacherOrder(order.id);
+  res.json({ order: updated });
+}));
+
+// 获取需求关联的订单
+app.get("/api/requests/:id/order", auth, wrap(async (req, res) => {
+  const requestId = +req.params.id;
+  const order = await store.getTeacherOrderByRequest(requestId);
+  if (!order) return res.json({ order: null });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.json({ order: null });
+  res.json({ order });
+}));
+
+/* ============== 课时/排课 ============== */
+// 获取订单的课时列表
+app.get("/api/orders/:id/lessons", auth, wrap(async (req, res) => {
+  const order = await store.getTeacherOrder(+req.params.id);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权查看" });
+  const lessons = await store.listLessons(order.id);
+  res.json({ lessons });
+}));
+
+// 添加课时
+app.post("/api/orders/:id/lessons", auth, wrap(async (req, res) => {
+  const order = await store.getTeacherOrder(+req.params.id);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.status !== "teaching") return res.status(400).json({ error: "仅授课中的订单可添加课时" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权操作" });
+  const { title, startTime, endTime, notes } = req.body || {};
+  if (!startTime) return res.status(400).json({ error: "请填写上课时间" });
+  const lesson = await store.createLesson({
+    orderId: order.id, title: title || "", startTime: +startTime, 
+    endTime: endTime ? +endTime : 0, notes: notes || "",
+  });
+  res.json({ lesson });
+}));
+
+// 修改课时状态
+app.patch("/api/lessons/:id/status", auth, wrap(async (req, res) => {
+  const lesson = await store.getLesson(+req.params.id);
+  if (!lesson) return res.status(404).json({ error: "课时不存在" });
+  const order = await store.getTeacherOrder(lesson.orderId);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权操作" });
+  const { status } = req.body || {};
+  if (!["completed", "cancelled"].includes(status)) return res.status(400).json({ error: "状态无效" });
+  const updated = await store.updateLessonStatus(lesson.id, status);
+  res.json({ lesson: updated });
+}));
+
+// 编辑课时
+app.put("/api/lessons/:id", auth, wrap(async (req, res) => {
+  const lesson = await store.getLesson(+req.params.id);
+  if (!lesson) return res.status(404).json({ error: "课时不存在" });
+  const order = await store.getTeacherOrder(lesson.orderId);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权操作" });
+  const { title, startTime, endTime, notes } = req.body || {};
+  const updated = await store.updateLesson(lesson.id, { title, startTime, endTime, notes });
+  res.json({ lesson: updated });
+}));
+
+// 删除课时
+app.delete("/api/lessons/:id", auth, wrap(async (req, res) => {
+  const lesson = await store.getLesson(+req.params.id);
+  if (!lesson) return res.status(404).json({ error: "课时不存在" });
+  const order = await store.getTeacherOrder(lesson.orderId);
+  if (!order) return res.status(404).json({ error: "订单不存在" });
+  if (order.tutorId !== req.user.id && order.parentId !== req.user.id && req.user.role !== "admin")
+    return res.status(403).json({ error: "无权操作" });
+  await store.deleteLesson(lesson.id);
+  res.json({ ok: true });
+}));
+
+/* ============== 双向评价 ============== */
+// 家长评价老师
 app.post("/api/tutors/:id/reviews", auth, wrap(async (req, res) => {
   if (req.user.role !== "parent") return res.status(403).json({ error: "仅家长可评价" });
   const tutorId = +req.params.id;
   if (!(await store.getTutor(tutorId))) return res.status(404).json({ error: "老师不存在" });
   const rating = Number((req.body || {}).rating);
   if (!(rating >= 1 && rating <= 5)) return res.status(400).json({ error: "评分需为 1-5 星" });
-  const review = await store.createReview({ tutorId, parentId: req.user.id, rating, comment: (req.body || {}).comment || "" });
+  const review = await store.createReview({ tutorId, parentId: req.user.id, rating, comment: (req.body || {}).comment || "", direction: "to_tutor" });
   res.json({ review });
+}));
+
+// 老师评价家长（基于已完成订单）
+app.post("/api/parents/:id/reviews", auth, wrap(async (req, res) => {
+  if (req.user.role !== "tutor") return res.status(403).json({ error: "仅老师可评价家长" });
+  const parentId = +req.params.id;
+  const { rating, comment, orderId } = req.body || {};
+  if (!(rating >= 1 && rating <= 5)) return res.status(400).json({ error: "评分需为 1-5 星" });
+  // 验证该老师有与这个家长的已完成的订单
+  if (orderId) {
+    const order = await store.getTeacherOrder(+orderId);
+    if (!order || order.tutorId !== req.user.id || order.parentId !== parentId)
+      return res.status(403).json({ error: "无权评价此家长" });
+  }
+  const review = await store.reviewParent ? await store.reviewParent(+orderId, parentId, req.user.id, rating, comment || "") :
+    await store.createReview({ tutorId: req.user.id, parentId, rating, comment: comment || "", direction: "to_parent" });
+  res.json({ review });
+}));
+
+// 查看家长收到的评价
+app.get("/api/parents/:id/ratings", optionalAuth, wrap(async (req, res) => {
+  const r = await store.parentRatings ? await store.parentRatings(+req.params.id) : { avg: 0, count: 0 };
+  res.json(r);
 }));
 
 /* ============== 收藏 ============== */
@@ -285,6 +518,8 @@ app.post("/api/messages", auth, wrap(async (req, res) => {
   const { toId, text, kind = "text", fileUrl, fileName } = req.body || {};
   if (+toId === req.user.id) return res.status(400).json({ error: "不能给自己发消息" });
   if (!(await store.findUserById(+toId))) return res.status(404).json({ error: "对方不存在" });
+  if (await store.isBlocked && await store.isBlocked(+toId, req.user.id))
+    return res.status(403).json({ error: "对方已将你屏蔽，无法发送消息" });
   if (kind === "text") {
     if (!text || !text.trim()) return res.status(400).json({ error: "消息不能为空" });
   } else {
@@ -310,6 +545,73 @@ app.get("/api/messages/:userId", auth, wrap(async (req, res) => {
 }));
 
 app.get("/api/unread", auth, wrap(async (req, res) => res.json({ count: await store.unreadCount(req.user.id) })));
+
+/* ============== 通知中心 ============== */
+// 创建通知助手
+async function notify(userId, type, title, body, refId) {
+  try { await store.createNotification({ userId, type, title, body, refId }); } catch {}
+}
+
+app.get("/api/notifications", auth, wrap(async (req, res) => {
+  res.json({ notifications: await store.listNotifications(req.user.id) });
+}));
+
+app.post("/api/notifications/:id/read", auth, wrap(async (req, res) => {
+  await store.markNotificationRead(+req.params.id);
+  res.json({ ok: true });
+}));
+
+app.post("/api/notifications/read-all", auth, wrap(async (req, res) => {
+  await store.markAllNotificationsRead(req.user.id);
+  res.json({ ok: true });
+}));
+
+app.get("/api/notifications/unread", auth, wrap(async (req, res) => {
+  res.json({ count: await store.unreadNotificationCount(req.user.id) });
+}));
+
+/* ============== 修改密码 ============== */
+app.post("/api/change-password", auth, wrap(async (req, res) => {
+  const { oldPassword, newPassword } = req.body || {};
+  if (!oldPassword || !newPassword) return res.status(400).json({ error: "请填写旧密码和新密码" });
+  if (newPassword.length < 4) return res.status(400).json({ error: "新密码至少 4 位" });
+  if (!verifyPwd(oldPassword, req.user.pwd)) return res.status(400).json({ error: "旧密码错误" });
+  await store.resetPassword(req.user.id, hashPwd(newPassword));
+  res.json({ ok: true });
+}));
+
+/* ============== 沟通偏好 ============== */
+// 屏蔽用户
+app.post("/api/block/:userId", auth, wrap(async (req, res) => {
+  const blockedId = +req.params.userId;
+  if (blockedId === req.user.id) return res.status(400).json({ error: "不能屏蔽自己" });
+  const ok2 = await store.blockUser(req.user.id, blockedId);
+  res.json({ ok: ok2 });
+}));
+
+app.post("/api/unblock/:userId", auth, wrap(async (req, res) => {
+  await store.unblockUser(req.user.id, +req.params.userId);
+  res.json({ ok: true });
+}));
+
+app.get("/api/blocked", auth, wrap(async (req, res) => {
+  res.json({ ids: await store.blockedIds(req.user.id) });
+}));
+
+app.get("/api/blocked/:userId", auth, wrap(async (req, res) => {
+  res.json({ blocked: await store.isBlocked(req.user.id, +req.params.userId) });
+}));
+
+// 通知偏好
+app.get("/api/prefs", auth, wrap(async (req, res) => {
+  res.json({ prefs: await store.getUserPrefs(req.user.id) });
+}));
+
+app.put("/api/prefs", auth, wrap(async (req, res) => {
+  const { quietStart, quietEnd, onlyVerified } = req.body || {};
+  const prefs = await store.setUserPrefs(req.user.id, { quietStart, quietEnd, onlyVerified });
+  res.json({ prefs });
+}));
 
 /* ============== 管理员后台 ============== */
 const ROLES = ["tutor", "parent", "admin"];
@@ -394,15 +696,85 @@ app.get("/api/match", auth, wrap(async (req, res) => {
   res.json({ type: "tutors", items: tutors, basedOn });
 }));
 
+/* ============== WebSocket 实时消息 ============== */
+io.use(async (socket, next) => {
+  const user = await resolveUser(tokenOfWS(socket.handshake.auth));
+  if (!user) return next(new Error("未登录或 token 无效"));
+  if (user.banned) return next(new Error("账号已被封禁"));
+  socket.data.user = user;
+  wsUserMap.set(socket.id, user.id);
+  next();
+});
+
+io.on("connection", (socket) => {
+  const user = socket.data.user;
+  const room = `user:${user.id}`;
+  socket.join(room);
+  console.log(`🔌 WS 连接: ${user.name}(${user.id})`);
+
+  // 发送消息
+  socket.on("message:send", async (data, ack) => {
+    try {
+      const { toId, text, kind, fileUrl, fileName } = data || {};
+      if (+toId === user.id) return ack?.({ error: "不能给自己发消息" });
+      if (!(await store.findUserById(+toId))) return ack?.({ error: "对方不存在" });
+      // 检查对方是否屏蔽了我
+      if (await store.isBlocked && await store.isBlocked(+toId, user.id))
+        return ack?.({ error: "对方已将你屏蔽，无法发送消息" });
+      if ((kind || "text") === "text") {
+        if (!text || !text.trim()) return ack?.({ error: "消息不能为空" });
+      } else {
+        if (!/^\/uploads\/[\w.-]+$/.test(String(fileUrl || ""))) return ack?.({ error: "附件无效" });
+      }
+      const msg = await store.createMessage({
+        fromId: user.id, toId: +toId,
+        text: (text || "").trim(), kind: kind || "text", fileUrl, fileName,
+      });
+      // 推给双方
+      [room, `user:${toId}`].forEach((r) => {
+        io.to(r).emit("message:new", msg);
+      });
+      // 推未读数给接收方
+      const count = await store.unreadCount(+toId);
+      io.to(`user:${toId}`).emit("unread:update", count);
+      ack?.({ ok: true, message: msg });
+    } catch (e) {
+      console.error("WS 消息发送失败:", e);
+      ack?.({ error: e.message });
+    }
+  });
+
+  // 标记已读
+  socket.on("message:read", async (otherId) => {
+    try {
+      if (!otherId) return;
+      await store.thread(user.id, +otherId); // thread 内含标记已读逻辑
+      const count = await store.unreadCount(user.id);
+      io.to(room).emit("unread:update", count);
+    } catch { /* 静默 */ }
+  });
+
+  // 正在输入
+  socket.on("typing", (toId) => {
+    if (!toId) return;
+    io.to(`user:${toId}`).emit("typing", { fromId: user.id, name: user.name });
+  });
+
+  socket.on("disconnect", () => {
+    wsUserMap.delete(socket.id);
+    console.log(`🔌 WS 断开: ${user.name}(${user.id})`);
+  });
+});
+
 /* ============== 启动 ============== */
 // 本地直接运行：初始化数据库并监听端口
 if (require.main === module) {
   store.init().then(() => {
-    app.listen(PORT, () => console.log(`✅ 家教帮已启动： http://localhost:${PORT}`));
+    server.listen(PORT, () => console.log(`✅ 家教帮已启动： http://localhost:${PORT}`));
   }).catch((e) => { console.error("数据库初始化失败：", e); process.exit(1); });
 } else {
   // 被 import（如 Vercel serverless）：建表幂等，后台执行一次，不阻塞请求
   store.init().catch((e) => console.error("建表失败：", e));
 }
 
-module.exports = app;
+module.exports = { app, server, io };

@@ -12,7 +12,10 @@ function load() {
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ seq: 1 }, null, 2));
   const d = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
   d.users ??= []; d.tutors ??= []; d.requests ??= []; d.reviews ??= [];
-  d.favorites ??= []; d.messages ??= []; d.orders ??= []; d.sessions ??= {}; d.seq ??= 1;
+  d.favorites ??= []; d.messages ??= []; d.orders ??= []; d.sessions ??= {};
+  d.applications ??= []; d.teacherOrders ??= []; d.notifications ??= []; d.seq ??= 1;
+  d.blocked ??= []; d.userPrefs ??= {};
+  d.lessons ??= [];
   return d;
 }
 let db = load();
@@ -84,12 +87,15 @@ module.exports = {
   async allTutorsVisible() { return db.tutors.filter(isVisible).map((t) => ({ ...decorate(t), ...rating(t.userId) })); },
 
   /* 需求 */
-  async createRequest(r) { const item = { id: nextId(), createdAt: Date.now(), ...r }; db.requests.push(item); save(); return item; },
-  async listRequests({ subject, region, mode } = {}) {
+  async createRequest(r) { const item = { id: nextId(), status: "open", createdAt: Date.now(), ...r }; db.requests.push(item); save(); return item; },
+  async getRequest(id) { return db.requests.find((r) => r.id === id) || null; },
+  async setRequestStatus(id, status) { const r = db.requests.find((x) => x.id === id); if (r) { r.status = status; save();} },
+  async listRequests({ subject, region, mode, status } = {}) {
     let list = [...db.requests];
     if (subject) list = list.filter((r) => r.subject === subject);
     if (region) list = list.filter((r) => (r.region || "").includes(region));
     if (mode) list = list.filter((r) => r.mode === mode);
+    if (status) list = list.filter((r) => r.status === status);
     return list.map((r) => ({ ...r, parentName: userName(r.parentId) || "家长" })).sort((a, b) => b.createdAt - a.createdAt);
   },
   async allRequests() { return db.requests.map((r) => ({ ...r, parentName: userName(r.parentId) || "家长" })); },
@@ -100,6 +106,35 @@ module.exports = {
   async listReviews(tutorId) {
     return db.reviews.filter((r) => r.tutorId === tutorId)
       .map((r) => ({ ...r, parentName: userName(r.parentId) || "匿名" })).sort((a, b) => b.createdAt - a.createdAt);
+  },
+
+  /* 双向评价 - 家长评分 */
+  async reviewParent(orderId, parentId, tutorId, rating, comment) {
+    const rev = { id: nextId(), orderId, parentId, tutorId, rating, comment: comment || "", direction: "to_parent", createdAt: Date.now() };
+    db.reviews.push(rev); save(); return rev;
+  },
+  async parentRatings(parentId) {
+    const rs = db.reviews.filter((r) => r.parentId === parentId && r.direction === "to_parent");
+    if (!rs.length) return { avg: 0, count: 0 };
+    return { avg: Math.round((rs.reduce((s, r) => s + r.rating, 0) / rs.length) * 10) / 10, count: rs.length };
+  },
+
+  /* 通知中心 */
+  async createNotification(n) {
+    const notif = { id: nextId(), userId: n.userId, type: n.type, title: n.title, body: n.body || "", refId: n.refId || null, read: false, createdAt: Date.now() };
+    db.notifications.push(notif); save(); return notif;
+  },
+  async listNotifications(userId) {
+    return db.notifications.filter(n => n.userId === userId).sort((a,b) => b.createdAt - a.createdAt).slice(0, 50);
+  },
+  async markNotificationRead(id) {
+    const n = db.notifications.find(x => x.id === id); if (n) { n.read = true; save(); }
+  },
+  async unreadNotificationCount(userId) {
+    return db.notifications.filter(n => n.userId === userId && !n.read).length;
+  },
+  async markAllNotificationsRead(userId) {
+    db.notifications.filter(n => n.userId === userId).forEach(n => n.read = true); save();
   },
 
   /* 收藏 */
@@ -140,6 +175,77 @@ module.exports = {
     return msgs;
   },
   async unreadCount(userId) { return db.messages.filter((m) => m.toId === userId && !m.read).length; },
+  async contactedUserIds(userId) {
+    const ids = new Set();
+    db.messages.filter((m) => m.fromId === userId).forEach((m) => ids.add(m.toId));
+    db.messages.filter((m) => m.toId === userId).forEach((m) => ids.add(m.fromId));
+    return [...ids];
+  },
+
+  /* 接单申请 */
+  async createApplication(a) {
+    const app = { id: nextId(), requestId: a.requestId, tutorId: a.tutorId, message: a.message || "", status: "pending", createdAt: Date.now() };
+    db.applications.push(app); save(); return app;
+  },
+  async getApplication(id) { return db.applications.find((a) => a.id === id) || null; },
+  async listApplications(requestId) {
+    return db.applications.filter((a) => a.requestId === requestId).sort((a, b) => b.createdAt - a.createdAt).map((a) => {
+      const u = db.users.find((x) => x.id === a.tutorId) || {};
+      const t = db.tutors.find((x) => x.userId === a.tutorId);
+      return { ...a, tutorName: u.name || "老师", tutorSchool: t?.school || "", tutorVerified: !!t?.verified };
+    });
+  },
+  async approveApplication(id) {
+    const a = db.applications.find((x) => x.id === id); if (!a) return null;
+    a.status = "approved"; save();
+    const req = db.requests.find((r) => r.id === a.requestId);
+    if (req) { req.status = "matched"; save(); }
+    return a;
+  },
+  async rejectApplication(id) {
+    const a = db.applications.find((x) => x.id === id); if (!a) return null;
+    a.status = "rejected"; save(); return a;
+  },
+
+  /* 授课订单 */
+  async createTeacherOrder(data) {
+    const order = { id: nextId(), requestId: data.requestId, tutorId: data.tutorId, parentId: data.parentId,
+      subject: data.subject, grade: data.grade, mode: data.mode, region: data.region,
+      hourlyRate: data.hourlyRate, status: "teaching", createdAt: Date.now(), completedAt: 0 };
+    db.teacherOrders.push(order); save(); return order;
+  },
+  async getTeacherOrder(id) {
+    const o = db.teacherOrders.find((x) => x.id === id);
+    if (!o) return null;
+    const tutorName = userName(o.tutorId) || "老师";
+    const parentName = userName(o.parentId) || "家长";
+    return { ...o, tutorName, parentName };
+  },
+  async getTeacherOrderByRequest(requestId) {
+    const o = db.teacherOrders.find((x) => x.requestId === requestId);
+    if (!o) return null;
+    const tutorName = userName(o.tutorId) || "老师";
+    const parentName = userName(o.parentId) || "家长";
+    return { ...o, tutorName, parentName };
+  },
+  async listTeacherOrders(userId) {
+    let list = db.teacherOrders.filter((o) => o.tutorId === userId || o.parentId === userId);
+    list.sort((a, b) => b.createdAt - a.createdAt);
+    return list.map((o) => {
+      const isTutor = o.tutorId === userId;
+      const peerId = isTutor ? o.parentId : o.tutorId;
+      const peerName = userName(peerId) || (isTutor ? "家长" : "老师");
+      return { ...o, peerName, peerRole: isTutor ? "parent" : "tutor" };
+    });
+  },
+  async updateTeacherOrderStatus(id, status) {
+    if (status !== "completed" && status !== "cancelled") return null;
+    const o = db.teacherOrders.find((x) => x.id === id);
+    if (!o) return null;
+    o.status = status;
+    if (status === "completed") o.completedAt = Date.now();
+    save(); return o;
+  },
 
   /* 订单 / 权益（会员 & 置顶） */
   async createOrder(o) {
@@ -175,6 +281,7 @@ module.exports = {
   async deleteUser(id) {
     db.reviews = db.reviews.filter((r) => r.parentId !== id && r.tutorId !== id);
     db.requests = db.requests.filter((r) => r.parentId !== id);
+    db.applications = db.applications.filter((a) => a.tutorId !== id && a.requestId !== id);
     db.messages = db.messages.filter((m) => m.fromId !== id && m.toId !== id);
     db.favorites = db.favorites.filter((f) => f.userId !== id && f.tutorId !== id);
     db.orders = db.orders.filter((o) => o.userId !== id);
@@ -184,7 +291,10 @@ module.exports = {
     save();
   },
   async deleteReview(id) { db.reviews = db.reviews.filter((r) => r.id !== id); save(); },
-  async deleteRequest(id) { db.requests = db.requests.filter((r) => r.id !== id); save(); },
+  async deleteRequest(id) {
+    db.applications = db.applications.filter((a) => a.requestId !== id);
+    db.requests = db.requests.filter((r) => r.id !== id); save();
+  },
   async deleteTutorProfile(userId) {
     db.favorites = db.favorites.filter((f) => f.tutorId !== userId);
     db.reviews = db.reviews.filter((r) => r.tutorId !== userId);
@@ -196,6 +306,66 @@ module.exports = {
       ...r, tutorName: userName(r.tutorId) || "—", parentName: userName(r.parentId) || "匿名",
     }));
   },
+  /* 屏蔽用户 */
+  async blockUser(userId, blockedId) {
+    if (+userId === +blockedId) return false;
+    const i = db.blocked.findIndex(b => b.userId === userId && b.blockedId === blockedId);
+    if (i >= 0) return false;
+    db.blocked.push({ userId, blockedId, createdAt: Date.now() });
+    save(); return true;
+  },
+  async unblockUser(userId, blockedId) {
+    db.blocked = db.blocked.filter(b => !(b.userId === userId && b.blockedId === blockedId));
+    save();
+  },
+  async blockedIds(userId) { return db.blocked.filter(b => b.userId === userId).map(b => b.blockedId); },
+  async isBlocked(userId, targetId) {
+    return db.blocked.some(b => b.userId === userId && b.blockedId === targetId);
+  },
+
+  /* 通知偏好 */
+  async setUserPrefs(userId, prefs) {
+    db.userPrefs[userId] = { ...(db.userPrefs[userId] || {}), ...prefs };
+    save(); return db.userPrefs[userId];
+  },
+  async getUserPrefs(userId) { return db.userPrefs[userId] || { quietStart: "", quietEnd: "", onlyVerified: false }; },
+
+  /* 课时 */
+  async createLesson(data) {
+    const lesson = {
+      id: nextId(), orderId: data.orderId, title: data.title || "",
+      startTime: data.startTime, endTime: data.endTime, status: "scheduled",
+      notes: data.notes || "", createdAt: Date.now(),
+    };
+    db.lessons.push(lesson); save(); return lesson;
+  },
+  async listLessons(orderId) {
+    return db.lessons.filter((l) => l.orderId === orderId).sort((a, b) => a.startTime - b.startTime);
+  },
+  async getLesson(id) {
+    return db.lessons.find((l) => l.id === id) || null;
+  },
+  async updateLesson(id, data) {
+    const l = db.lessons.find((x) => x.id === id);
+    if (!l) return null;
+    if (data.title !== undefined) l.title = data.title;
+    if (data.startTime !== undefined) l.startTime = data.startTime;
+    if (data.endTime !== undefined) l.endTime = data.endTime;
+    if (data.notes !== undefined) l.notes = data.notes;
+    save(); return l;
+  },
+  async updateLessonStatus(id, status) {
+    if (status !== "completed" && status !== "cancelled") return null;
+    const l = db.lessons.find((x) => x.id === id);
+    if (!l) return null;
+    l.status = status;
+    save(); return l;
+  },
+  async deleteLesson(id) {
+    db.lessons = db.lessons.filter((l) => l.id !== id);
+    save();
+  },
+
   async adminStats() {
     return { users: db.users.length, tutors: db.tutors.length, requests: db.requests.length, reviews: db.reviews.length };
   },

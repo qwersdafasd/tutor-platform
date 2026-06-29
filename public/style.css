@@ -126,6 +126,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .req-card .req-top{display:flex;justify-content:space-between;align-items:flex-start}
 .req-subject{font-weight:700;font-size:16px}
 .badge{display:inline-block;background:#fff4ee;color:var(--accent);font-size:12px;padding:3px 9px;border-radius:6px}
+.badge-open{background:#eef2fb;color:var(--primary)}
+.badge-matched{background:#eafaf0;color:var(--ok)}
+.badge-completed{background:#e8f3ff;color:var(--primary)}
+.badge-closed{background:#f0f2f7;color:var(--sub)}
+.contacted-tag{display:inline-block;font-size:11px;color:var(--ok);background:#eafaf0;padding:1px 7px;border-radius:5px}
 
 /* 会话/消息 */
 .conv{display:flex;align-items:center;gap:12px;padding:13px 4px;border-bottom:1px solid var(--line);cursor:pointer}
@@ -151,6 +156,13 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary)
 .chat-file{display:inline-block;max-width:100%;padding:10px 12px;border-radius:12px;background:#fff;border:1px solid var(--line);
   color:var(--primary);text-decoration:none;word-break:break-all;font-size:14px}
 .bubble.me.media .chat-file{background:var(--primary);color:#fff;border-color:var(--primary)}
+
+/* 消息搜索栏 */
+.chat-search{display:block;width:calc(100% - 28px);margin:0 14px 4px;padding:8px 12px;border:1px solid var(--line);border-radius:20px;font-size:13px;background:#fff;font-family:inherit;color:var(--txt);position:sticky;top:var(--nav-h);z-index:20}
+.chat-search:focus{outline:none;border-color:var(--primary)}
+
+/* 正在输入提示 */
+.typing-tip{font-size:12px;color:var(--sub);padding:4px 12px;align-self:flex-start}
 
 .toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#1f2733;color:#fff;
   padding:11px 20px;border-radius:11px;font-size:14px;z-index:100;opacity:0;transition:.3s;pointer-events:none;white-space:nowrap}

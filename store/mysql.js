@@ -1,19 +1,19 @@
 /**
- * MySQL 数据层（本地/自建库用）。实现与 store/json.js、store/pg.js 相同的异步 API。
+ * MySQL 数据层(本地/自建库用)。实现与 store/json.js、store/pg.js 相同的异步 API。
  *
- * 连接配置（.env）：
- *   MYSQL_URL=mysql://user:pass@host:3306/tutor_platform   （优先）
- *   或分项：MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
+ * 连接配置(.env):
+ *   MYSQL_URL=mysql://user:pass@host:3306/tutor_platform   (优先)
+ *   或分项:MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
  *
- * 与 Postgres 的差异处理：
- *   - JSONB → JSON 列；数组写入用 JSON.stringify，读取用 parseJSON 容错。
- *   - 自增主键用 AUTO_INCREMENT，插入后取 result.insertId。
- *   - 布尔用 TINYINT(1)，读取用 !! 转。
- *   - 保留字列名（read/text）一律用反引号包裹。
+ * 与 Postgres 的差异处理:
+ *   - JSONB → JSON 列;数组写入用 JSON.stringify,读取用 parseJSON 容错。
+ *   - 自增主键用 AUTO_INCREMENT,插入后取 result.insertId。
+ *   - 布尔用 TINYINT(1),读取用 !! 转。
+ *   - 保留字列名(read/text)一律用反引号包裹。
  */
 const mysql = require("mysql2/promise");
 
-// 解析连接配置：优先 MYSQL_URL，否则用分项环境变量（带本地默认值）
+// 解析连接配置:优先 MYSQL_URL,否则用分项环境变量(带本地默认值)
 function dbConfig() {
   if (process.env.MYSQL_URL) {
     const u = new URL(process.env.MYSQL_URL);
@@ -34,7 +34,7 @@ const CFG = dbConfig();
 const pool = mysql.createPool({
   ...CFG, waitForConnections: true, connectionLimit: 30, queueLimit: 0, charset: "utf8mb4",
 });
-// 查询助手：返回 rows（mysql2 的 execute 返回 [rows, fields]）
+// 查询助手:返回 rows(mysql2 的 execute 返回 [rows, fields])
 const q = async (sql, params = []) => (await pool.execute(sql, params))[0];
 const num = (v) => (v == null ? 0 : Number(v));
 const parseJSON = (v, dft = []) => {
@@ -59,20 +59,27 @@ function rowToTutor(r) {
 const rowToOrder = (r) => ({ id: r.id, userId: r.user_id, type: r.type, plan: r.plan, amount: num(r.amount),
   days: num(r.days), outTradeNo: r.out_trade_no, status: r.status, createdAt: num(r.created_at), paidAt: num(r.paid_at) });
 const rowToReq = (r) => ({ id: r.id, parentId: r.parent_id, subject: r.subject, grade: r.grade, mode: r.mode,
-  region: r.region || "", budget: r.budget || "", desc: r.descr || "", phone: r.phone, createdAt: num(r.created_at) });
+  region: r.region || "", budget: r.budget || "", desc: r.descr || "", phone: r.phone, status: r.status || "open", createdAt: num(r.created_at) });
+const rowToApplication = (r) => ({ id: r.id, requestId: r.request_id, tutorId: r.tutor_id, message: r.message || "", status: r.status, createdAt: num(r.created_at) });
 const rowToMsg = (r) => ({ id: r.id, fromId: r.from_id, toId: r.to_id, text: r.text || "",
   kind: r.kind || "text", fileUrl: r.file_url || undefined, fileName: r.file_name || undefined,
   read: !!r.read, createdAt: num(r.created_at) });
 const rowToUser = (r) => ({ id: r.id, name: r.name, phone: r.phone, role: r.role, pwd: r.pwd,
   banned: !!r.banned, createdAt: num(r.created_at) });
-// 会话列表里展示的“最后一条”摘要
+const rowToTeacherOrder = (r) => ({ id: r.id, requestId: r.request_id, tutorId: r.tutor_id, parentId: r.parent_id,
+  subject: r.subject, grade: r.grade, mode: r.mode, region: r.region || "",
+  hourlyRate: num(r.hourly_rate), status: r.status, createdAt: num(r.created_at), completedAt: num(r.completed_at) });
+const rowToPrefs = (r) => ({ quietStart: r.quiet_start || "", quietEnd: r.quiet_end || "", onlyVerified: !!r.only_verified });
+const rowToNotification = (r) => ({ id: r.id, userId: r.user_id, type: r.type, title: r.title, body: r.body || "", refId: r.ref_id, read: !!r.read, createdAt: num(r.created_at) });
+const rowToLesson = (r) => ({ id: r.id, orderId: r.order_id, title: r.title || "", startTime: num(r.start_time), endTime: num(r.end_time), status: r.status, notes: r.notes || "", createdAt: num(r.created_at) });
+// 会话列表里展示的"最后一条"摘要
 const msgPreview = (m) => m.kind === "image" ? "[图片]" : m.kind === "file" ? `[文件] ${m.fileName || ""}`.trim() : (m.text || "");
 
 module.exports = {
   kind: "mysql",
 
   async init() {
-    // 库可能尚不存在：先用不带 database 的连接建库，再用主 pool 建表
+    // 库可能尚不存在:先用不带 database 的连接建库,再用主 pool 建表
     const { database, ...rest } = CFG;
     const boot = await mysql.createConnection(rest);
     await boot.query(`CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
@@ -93,6 +100,16 @@ module.exports = {
       mode VARCHAR(20), region VARCHAR(80), budget VARCHAR(60), descr TEXT, phone VARCHAR(40), created_at BIGINT)`);
     await q(`CREATE TABLE IF NOT EXISTS reviews(
       id INT AUTO_INCREMENT PRIMARY KEY, tutor_id INT, parent_id INT, rating INT, comment TEXT, created_at BIGINT)`);
+    await q(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS direction VARCHAR(20) DEFAULT 'to_tutor'`);
+    await q(`CREATE TABLE IF NOT EXISTS notifications(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT,
+      type VARCHAR(30),
+      title VARCHAR(200),
+      body TEXT,
+      ref_id INT,
+      \`read\` TINYINT(1) DEFAULT 0,
+      created_at BIGINT)`);
     await q(`CREATE TABLE IF NOT EXISTS favorites(
       user_id INT, tutor_id INT, created_at BIGINT, PRIMARY KEY(user_id, tutor_id))`);
     await q(`CREATE TABLE IF NOT EXISTS messages(
@@ -101,10 +118,30 @@ module.exports = {
       \`read\` TINYINT(1) DEFAULT 0, created_at BIGINT)`);
     await q(`CREATE TABLE IF NOT EXISTS sessions(
       token VARCHAR(64) PRIMARY KEY, user_id INT, created_at BIGINT)`);
-    await q(`CREATE TABLE IF NOT EXISTS orders(
-      id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, type VARCHAR(20) NOT NULL, plan VARCHAR(30) NOT NULL,
-      amount INT NOT NULL, days INT NOT NULL, out_trade_no VARCHAR(40) UNIQUE NOT NULL,
-      status VARCHAR(20) DEFAULT 'pending', created_at BIGINT NOT NULL, paid_at BIGINT DEFAULT 0)`);
+    await q(`ALTER TABLE requests ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'open'`);
+    await q(`CREATE TABLE IF NOT EXISTS applications(
+      id INT AUTO_INCREMENT PRIMARY KEY, request_id INT NOT NULL, tutor_id INT NOT NULL,
+      message TEXT, status VARCHAR(20) DEFAULT 'pending', created_at BIGINT NOT NULL)`);
+    await q(`CREATE TABLE IF NOT EXISTS teacher_orders(
+      id INT AUTO_INCREMENT PRIMARY KEY, request_id INT, tutor_id INT, parent_id INT,
+      subject VARCHAR(40), grade VARCHAR(40), mode VARCHAR(20), region VARCHAR(80),
+      hourly_rate INT DEFAULT 0, status VARCHAR(20) DEFAULT 'teaching',
+      created_at BIGINT, completed_at BIGINT DEFAULT 0)`);
+    await q(`CREATE TABLE IF NOT EXISTS blocked(
+      user_id INT, blocked_id INT, created_at BIGINT, PRIMARY KEY(user_id, blocked_id))`);
+    await q(`CREATE TABLE IF NOT EXISTS user_prefs(
+      user_id INT PRIMARY KEY, quiet_start VARCHAR(10) DEFAULT '', quiet_end VARCHAR(10) DEFAULT '',
+      only_verified TINYINT(1) DEFAULT 0)`);
+    await q(`CREATE TABLE IF NOT EXISTS lessons(
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      order_id INT,
+      title VARCHAR(120) DEFAULT '',
+      start_time BIGINT,
+      end_time BIGINT,
+      status VARCHAR(20) DEFAULT 'scheduled',
+      notes TEXT,
+      created_at BIGINT
+    )`);
     console.log("✅ MySQL 数据表已就绪");
   },
 
@@ -148,7 +185,7 @@ module.exports = {
     const rows = await q(`SELECT AVG(rating) avg, COUNT(*) count FROM reviews WHERE tutor_id=?`, [userId]);
     const r = rows[0]; return { avg: r.avg != null ? Math.round(Number(r.avg) * 10) / 10 : 0, count: num(r.count) };
   },
-  // 把评分聚合进老师列表（避免 N 次查询）
+  // 把评分聚合进老师列表(避免 N 次查询)
   async _withRatings(tutors) {
     if (!tutors.length) return tutors;
     const rows = await q(`SELECT tutor_id, AVG(rating) avg, COUNT(*) count FROM reviews GROUP BY tutor_id`);
@@ -176,17 +213,22 @@ module.exports = {
 
   /* 需求 */
   async createRequest(r) {
-    const ins = await q(`INSERT INTO requests(parent_id,subject,grade,mode,region,budget,descr,phone,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+    const ins = await q(`INSERT INTO requests(parent_id,subject,grade,mode,region,budget,descr,phone,status,created_at) VALUES(?,?,?,?,?,?,?,?,'open',?)`,
       [r.parentId, r.subject, r.grade, r.mode, r.region || "", r.budget || "", r.desc || "", r.phone || "", Date.now()]);
-    return { id: ins.insertId, ...r, createdAt: Date.now() };
+    return { id: ins.insertId, ...r, status: "open", createdAt: Date.now() };
   },
-  async listRequests({ subject, region, mode } = {}) {
+  async listRequests({ subject, region, mode, status } = {}) {
     const rows = await q(`SELECT r.*, u.name parent_name FROM requests r LEFT JOIN users u ON u.id=r.parent_id ORDER BY r.created_at DESC`);
     let list = rows.map((r) => ({ ...rowToReq(r), parentName: r.parent_name || "家长" }));
     if (subject) list = list.filter((r) => r.subject === subject);
     if (region) list = list.filter((r) => (r.region || "").includes(region));
     if (mode) list = list.filter((r) => r.mode === mode);
+    if (status) list = list.filter((r) => r.status === status);
     return list;
+  },
+  async getRequest(id) {
+    const rows = await q(`SELECT r.*, u.name parent_name FROM requests r LEFT JOIN users u ON u.id=r.parent_id WHERE r.id=?`, [id]);
+    return rows[0] ? { ...rowToReq(rows[0]), status: rows[0].status || "open", parentName: rows[0].parent_name || "家长" } : null;
   },
   async allRequests() {
     const rows = await q(`SELECT r.*, u.name parent_name FROM requests r LEFT JOIN users u ON u.id=r.parent_id`);
@@ -195,6 +237,9 @@ module.exports = {
   async requestsByParent(parentId) {
     const rows = await q(`SELECT * FROM requests WHERE parent_id=? ORDER BY created_at DESC`, [parentId]);
     return rows.map(rowToReq);
+  },
+  async setRequestStatus(id, status) {
+    await q(`UPDATE requests SET status=? WHERE id=?`, [status, id]);
   },
 
   /* 评价 */
@@ -206,6 +251,39 @@ module.exports = {
   async listReviews(tutorId) {
     const rows = await q(`SELECT rv.*, u.name parent_name FROM reviews rv LEFT JOIN users u ON u.id=rv.parent_id WHERE rv.tutor_id=? ORDER BY rv.created_at DESC`, [tutorId]);
     return rows.map((r) => ({ id: r.id, tutorId: r.tutor_id, parentId: r.parent_id, rating: r.rating, comment: r.comment || "", createdAt: num(r.created_at), parentName: r.parent_name || "匿名" }));
+  },
+
+  /* 双向评价 - 家长评分 */
+  async reviewParent(orderId, parentId, tutorId, rating, comment) {
+    const ins = await q(`INSERT INTO reviews(order_id,parent_id,tutor_id,rating,comment,direction,created_at) VALUES(?,?,?,?,?,'to_parent',?)`,
+      [orderId, parentId, tutorId, rating, comment || "", Date.now()]);
+    return { id: ins.insertId, orderId, parentId, tutorId, rating, comment: comment || "", direction: "to_parent", createdAt: Date.now() };
+  },
+  async parentRatings(parentId) {
+    const rows = await q(`SELECT AVG(rating) avg, COUNT(*) count FROM reviews WHERE direction='to_parent' AND parent_id=?`, [parentId]);
+    const r = rows[0];
+    return { avg: r.avg != null ? Math.round(Number(r.avg) * 10) / 10 : 0, count: num(r.count) };
+  },
+
+  /* 通知中心 */
+  async createNotification(n) {
+    const ins = await q(`INSERT INTO notifications(user_id,type,title,body,ref_id,\`read\`,created_at) VALUES(?,?,?,?,?,0,?)`,
+      [n.userId, n.type, n.title, n.body || "", n.refId || null, Date.now()]);
+    return { id: ins.insertId, userId: n.userId, type: n.type, title: n.title, body: n.body || "", refId: n.refId || null, read: false, createdAt: Date.now() };
+  },
+  async listNotifications(userId) {
+    const rows = await q(`SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50`, [userId]);
+    return rows.map(rowToNotification);
+  },
+  async markNotificationRead(id) {
+    await q(`UPDATE notifications SET \`read\`=1 WHERE id=?`, [id]);
+  },
+  async unreadNotificationCount(userId) {
+    const rows = await q(`SELECT COUNT(*) count FROM notifications WHERE user_id=? AND \`read\`=0`, [userId]);
+    return num(rows[0].count);
+  },
+  async markAllNotificationsRead(userId) {
+    await q(`UPDATE notifications SET \`read\`=1 WHERE user_id=? AND \`read\`=0`, [userId]);
   },
 
   /* 收藏 */
@@ -279,6 +357,156 @@ module.exports = {
   },
   async listOrders(userId) { const rows = await q(`SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC`, [userId]); return rows.map(rowToOrder); },
 
+  /* 接单申请 */
+  async createApplication(a) {
+    const ins = await q(`INSERT INTO applications(request_id,tutor_id,message,status,created_at) VALUES(?,?,?,'pending',?)`,
+      [a.requestId, a.tutorId, a.message || "", Date.now()]);
+    return { id: ins.insertId, requestId: a.requestId, tutorId: a.tutorId, message: a.message || "", status: "pending", createdAt: Date.now() };
+  },
+  async getApplication(id) { const rows = await q(`SELECT * FROM applications WHERE id=?`, [id]); return rows[0] ? rowToApplication(rows[0]) : null; },
+  async listApplications(requestId) {
+    const rows = await q(`SELECT a.*, u.name tutor_name, t.school tutor_school, t.verified tutor_verified
+      FROM applications a LEFT JOIN users u ON u.id=a.tutor_id LEFT JOIN tutors t ON t.user_id=a.tutor_id
+      WHERE a.request_id=? ORDER BY a.created_at DESC`, [requestId]);
+    return rows.map((r) => ({ ...rowToApplication(r), tutorName: r.tutor_name || "老师", tutorSchool: r.tutor_school || "", tutorVerified: !!r.tutor_verified }));
+  },
+  async approveApplication(id) {
+    const upd = await q(`UPDATE applications SET status='approved' WHERE id=? AND status='pending'`, [id]);
+    if (!upd.affectedRows) return null;
+    const a = await this.getApplication(id);
+    if (a) await q(`UPDATE requests SET status='matched' WHERE id=?`, [a.requestId]);
+    return a;
+  },
+  async rejectApplication(id) {
+    await q(`UPDATE applications SET status='rejected' WHERE id=?`, [id]);
+    return this.getApplication(id);
+  },
+
+  /* 授课订单 */
+  async createTeacherOrder(data) {
+    const ins = await q(`INSERT INTO teacher_orders(request_id,tutor_id,parent_id,subject,grade,mode,region,hourly_rate,status,created_at,completed_at)
+      VALUES(?,?,?,?,?,?,?,?,'teaching',?,0)`,
+      [data.requestId, data.tutorId, data.parentId, data.subject, data.grade, data.mode, data.region, data.hourlyRate, Date.now()]);
+    return { id: ins.insertId, requestId: data.requestId, tutorId: data.tutorId, parentId: data.parentId,
+      subject: data.subject, grade: data.grade, mode: data.mode, region: data.region,
+      hourlyRate: data.hourlyRate, status: "teaching", createdAt: Date.now(), completedAt: 0 };
+  },
+  async getTeacherOrder(id) {
+    const rows = await q(`SELECT o.*, tu.name tutor_name, pu.name parent_name
+      FROM teacher_orders o LEFT JOIN users tu ON tu.id=o.tutor_id LEFT JOIN users pu ON pu.id=o.parent_id WHERE o.id=?`, [id]);
+    if (!rows[0]) return null;
+    const r = rows[0];
+    return { ...rowToTeacherOrder(r), tutorName: r.tutor_name || "老师", parentName: r.parent_name || "家长" };
+  },
+  async getTeacherOrderByRequest(requestId) {
+    const rows = await q(`SELECT o.*, tu.name tutor_name, pu.name parent_name
+      FROM teacher_orders o LEFT JOIN users tu ON tu.id=o.tutor_id LEFT JOIN users pu ON pu.id=o.parent_id WHERE o.request_id=?`, [requestId]);
+    if (!rows[0]) return null;
+    const r = rows[0];
+    return { ...rowToTeacherOrder(r), tutorName: r.tutor_name || "老师", parentName: r.parent_name || "家长" };
+  },
+  async listTeacherOrders(userId) {
+    const rows = await q(`SELECT o.*, tu.name tutor_name, pu.name parent_name
+      FROM teacher_orders o LEFT JOIN users tu ON tu.id=o.tutor_id LEFT JOIN users pu ON pu.id=o.parent_id
+      WHERE o.tutor_id=? OR o.parent_id=? ORDER BY o.created_at DESC`, [userId, userId]);
+    return rows.map((r) => {
+      const o = rowToTeacherOrder(r);
+      const isTutor = o.tutorId === userId;
+      const peerName = isTutor ? (r.parent_name || "家长") : (r.tutor_name || "老师");
+      return { ...o, peerName, peerRole: isTutor ? "parent" : "tutor" };
+    });
+  },
+  async updateTeacherOrderStatus(id, status) {
+    if (status !== "completed" && status !== "cancelled") return null;
+    if (status === "completed") {
+      await q(`UPDATE teacher_orders SET status=?, completed_at=? WHERE id=?`, [status, Date.now(), id]);
+    } else {
+      await q(`UPDATE teacher_orders SET status=? WHERE id=?`, [status, id]);
+    }
+    const rows = await q(`SELECT * FROM teacher_orders WHERE id=?`, [id]);
+    return rows[0] ? rowToTeacherOrder(rows[0]) : null;
+  },
+
+  /* 课时 */
+  async createLesson(data) {
+    const ins = await q(`INSERT INTO lessons(order_id,title,start_time,end_time,status,notes,created_at) VALUES(?,?,?,?,'scheduled',?,?)`,
+      [data.orderId, data.title || "", data.startTime, data.endTime, data.notes || "", Date.now()]);
+    const rows = await q(`SELECT * FROM lessons WHERE id=?`, [ins.insertId]);
+    return rowToLesson(rows[0]);
+  },
+  async listLessons(orderId) {
+    const rows = await q(`SELECT * FROM lessons WHERE order_id=? ORDER BY start_time ASC`, [orderId]);
+    return rows.map(rowToLesson);
+  },
+  async getLesson(id) {
+    const rows = await q(`SELECT * FROM lessons WHERE id=?`, [id]);
+    return rows[0] ? rowToLesson(rows[0]) : null;
+  },
+  async updateLesson(id, data) {
+    const sets = []; const p = [];
+    if (data.title !== undefined) { sets.push(`title=?`); p.push(data.title); }
+    if (data.startTime !== undefined) { sets.push(`start_time=?`); p.push(data.startTime); }
+    if (data.endTime !== undefined) { sets.push(`end_time=?`); p.push(data.endTime); }
+    if (data.notes !== undefined) { sets.push(`notes=?`); p.push(data.notes); }
+    if (sets.length) {
+      p.push(id);
+      await q(`UPDATE lessons SET ${sets.join(",")} WHERE id=?`, p);
+    }
+    const rows = await q(`SELECT * FROM lessons WHERE id=?`, [id]);
+    return rows[0] ? rowToLesson(rows[0]) : null;
+  },
+  async updateLessonStatus(id, status) {
+    if (status !== "completed" && status !== "cancelled") return null;
+    await q(`UPDATE lessons SET status=? WHERE id=?`, [status, id]);
+    const rows = await q(`SELECT * FROM lessons WHERE id=?`, [id]);
+    return rows[0] ? rowToLesson(rows[0]) : null;
+  },
+  async deleteLesson(id) {
+    await q(`DELETE FROM lessons WHERE id=?`, [id]);
+  },
+
+  /* 屏蔽用户 */
+  async blockUser(userId, blockedId) {
+    if (+userId === +blockedId) return false;
+    const rows = await q(`SELECT 1 FROM blocked WHERE user_id=? AND blocked_id=?`, [userId, blockedId]);
+    if (rows.length) return false;
+    await q(`INSERT INTO blocked(user_id,blocked_id,created_at) VALUES(?,?,?)`, [userId, blockedId, Date.now()]);
+    return true;
+  },
+  async unblockUser(userId, blockedId) {
+    await q(`DELETE FROM blocked WHERE user_id=? AND blocked_id=?`, [userId, blockedId]);
+  },
+  async blockedIds(userId) {
+    const rows = await q(`SELECT blocked_id FROM blocked WHERE user_id=?`, [userId]);
+    return rows.map(r => r.blocked_id);
+  },
+  async isBlocked(userId, targetId) {
+    const rows = await q(`SELECT 1 FROM blocked WHERE user_id=? AND blocked_id=?`, [userId, targetId]);
+    return rows.length > 0;
+  },
+
+  /* 通知偏好 */
+  async setUserPrefs(userId, prefs) {
+    await q(`INSERT INTO user_prefs(user_id,quiet_start,quiet_end,only_verified)
+      VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE
+      quiet_start=COALESCE(?,quiet_start), quiet_end=COALESCE(?,quiet_end), only_verified=COALESCE(?,only_verified)`,
+      [userId, prefs.quietStart ?? "", prefs.quietEnd ?? "", prefs.onlyVerified != null ? (prefs.onlyVerified ? 1 : 0) : 0,
+       prefs.quietStart ?? null, prefs.quietEnd ?? null, prefs.onlyVerified != null ? (prefs.onlyVerified ? 1 : 0) : null]);
+    const rows = await q(`SELECT * FROM user_prefs WHERE user_id=?`, [userId]);
+    return rows[0] ? rowToPrefs(rows[0]) : { quietStart: "", quietEnd: "", onlyVerified: false };
+  },
+  async getUserPrefs(userId) {
+    const rows = await q(`SELECT * FROM user_prefs WHERE user_id=?`, [userId]);
+    return rows[0] ? rowToPrefs(rows[0]) : { quietStart: "", quietEnd: "", onlyVerified: false };
+  },
+
+  /* 已联系用户 */
+  async contactedUserIds(userId) {
+    const rows = await q(`SELECT DISTINCT CASE WHEN from_id=? THEN to_id ELSE from_id END AS other_id
+      FROM messages WHERE from_id=? OR to_id=?`, [userId, userId, userId]);
+    return rows.map((r) => r.other_id);
+  },
+
   /* ============== 管理员 ============== */
   async listAllUsers() {
     const rows = await q(`SELECT * FROM users ORDER BY created_at DESC`);
@@ -291,6 +519,7 @@ module.exports = {
   async deleteUser(id) {
     await q(`DELETE FROM reviews WHERE parent_id=? OR tutor_id=?`, [id, id]);
     await q(`DELETE FROM requests WHERE parent_id=?`, [id]);
+    await q(`DELETE FROM applications WHERE tutor_id=?`, [id]);
     await q(`DELETE FROM messages WHERE from_id=? OR to_id=?`, [id, id]);
     await q(`DELETE FROM favorites WHERE user_id=? OR tutor_id=?`, [id, id]);
     await q(`DELETE FROM orders WHERE user_id=?`, [id]);
@@ -299,8 +528,8 @@ module.exports = {
     await q(`DELETE FROM users WHERE id=?`, [id]);
   },
   async deleteReview(id) { await q(`DELETE FROM reviews WHERE id=?`, [id]); },
-  async deleteRequest(id) { await q(`DELETE FROM requests WHERE id=?`, [id]); },
-  // 下架老师档案：删档案 + 收藏，保留用户账号
+  async deleteRequest(id) { await q(`DELETE FROM applications WHERE request_id=?`, [id]); await q(`DELETE FROM requests WHERE id=?`, [id]); },
+  // 下架老师档案:删档案 + 收藏,保留用户账号
   async deleteTutorProfile(userId) {
     await q(`DELETE FROM favorites WHERE tutor_id=?`, [userId]);
     await q(`DELETE FROM reviews WHERE tutor_id=?`, [userId]);
@@ -310,7 +539,7 @@ module.exports = {
     const rows = await q(`SELECT rv.*, tu.name tutor_name, pu.name parent_name
       FROM reviews rv LEFT JOIN users tu ON tu.id=rv.tutor_id LEFT JOIN users pu ON pu.id=rv.parent_id ORDER BY rv.created_at DESC`);
     return rows.map((r) => ({ id: r.id, tutorId: r.tutor_id, parentId: r.parent_id, rating: r.rating,
-      comment: r.comment || "", createdAt: num(r.created_at), tutorName: r.tutor_name || "—", parentName: r.parent_name || "匿名" }));
+      comment: r.comment || "", createdAt: num(r.created_at), tutorName: r.tutor_name || "-", parentName: r.parent_name || "匿名" }));
   },
   async adminStats() {
     const one = async (sql) => num((await q(sql))[0].c);
